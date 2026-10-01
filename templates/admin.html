@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+    <title>Coin Service Admin</title>
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+
+            font-family: Arial, sans-serif;
+
+            background: #f5f7fa;
+
+            color: #111827;
+        }
+
+        header {
+            background: white;
+
+            padding: 20px 30px;
+
+            display: flex;
+
+            justify-content: space-between;
+
+            align-items: center;
+
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        header h1 {
+            margin: 0;
+        }
+
+        .logout {
+            color: #dc2626;
+
+            text-decoration: none;
+        }
+
+        main {
+            padding: 30px;
+
+            max-width: 1400px;
+
+            margin: auto;
+        }
+
+        .stats {
+            display: grid;
+
+            grid-template-columns:
+                repeat(auto-fit, minmax(180px, 1fr));
+
+            gap: 15px;
+
+            margin-bottom: 25px;
+        }
+
+        .stat {
+            background: white;
+
+            padding: 20px;
+
+            border-radius: 14px;
+
+            box-shadow: 0 3px 15px rgba(0,0,0,.05);
+        }
+
+        .stat-number {
+            font-size: 30px;
+
+            font-weight: bold;
+
+            margin-top: 8px;
+        }
+
+        .table-container {
+            background: white;
+
+            border-radius: 14px;
+
+            overflow-x: auto;
+
+            box-shadow: 0 3px 15px rgba(0,0,0,.05);
+        }
+
+        table {
+            width: 100%;
+
+            border-collapse: collapse;
+
+            min-width: 750px;
+        }
+
+        th,
+        td {
+            padding: 15px;
+
+            text-align: left;
+
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        th {
+            background: #f9fafb;
+        }
+
+        .status {
+            padding: 6px 10px;
+
+            border-radius: 20px;
+
+            font-size: 13px;
+        }
+
+        .pending {
+            background: #fef3c7;
+        }
+
+        .progress {
+            background: #dbeafe;
+        }
+
+        .completed {
+            background: #dcfce7;
+        }
+
+        select {
+            padding: 7px;
+
+            border-radius: 7px;
+
+            border: 1px solid #d1d5db;
+        }
+
+        .delete {
+            background: #dc2626;
+
+            color: white;
+
+            border: none;
+
+            padding: 7px 11px;
+
+            border-radius: 7px;
+
+            cursor: pointer;
+        }
+
+        .delete:hover {
+            background: #b91c1c;
+        }
+
+        .coins {
+            font-size: 20px;
+
+            font-weight: bold;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+<header>
+
+    <h1>Coin Service Admin</h1>
+
+    <a class="logout" href="/logout">
+        Logout
+    </a>
+
+</header>
+
+
+<main>
+
+    <div class="stats">
+
+        <div class="stat">
+            Total Requests
+
+            <div class="stat-number">
+                {{ requests|length }}
+            </div>
+        </div>
+
+        <div class="stat">
+
+            Total Coins
+
+            <div class="stat-number">
+
+                {{ requests|sum(attribute='coins') }}
+
+            </div>
+
+        </div>
+
+        <div class="stat">
+
+            Pending
+
+            <div class="stat-number">
+
+                {{ requests|selectattr('status', 'equalto', 'Pending')|list|length }}
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="table-container">
+
+        <table>
+
+            <thead>
+
+                <tr>
+
+                    <th>ID</th>
+
+                    <th>Kiosk</th>
+
+                    <th>Coins</th>
+
+                    <th>Status</th>
+
+                    <th>Received</th>
+
+                    <th>Actions</th>
+
+                </tr>
+
+            </thead>
+
+            <tbody>
+
+            {% for r in requests %}
+
+                <tr>
+
+                    <td>
+                        #{{ r.id }}
+                    </td>
+
+                    <td>
+                        {{ r.kiosk_id }}
+                    </td>
+
+                    <td>
+                        <span class="coins">
+                            {{ r.coins }}
+                        </span>
+                    </td>
+
+                    <td>
+
+                        {% if r.status == "Pending" %}
+
+                            <span class="status pending">
+                                Pending
+                            </span>
+
+                        {% elif r.status == "In Progress" %}
+
+                            <span class="status progress">
+                                In Progress
+                            </span>
+
+                        {% else %}
+
+                            <span class="status completed">
+                                Completed
+                            </span>
+
+                        {% endif %}
+
+                    </td>
+
+                    <td>
+                        {{ r.created_at }}
+                    </td>
+
+                    <td>
+
+                        <form
+                            method="POST"
+                            action="/admin/status/{{ r.id }}"
+                            style="display:inline"
+                        >
+
+                            <select
+                                name="status"
+                                onchange="this.form.submit()"
+                            >
+
+                                <option
+                                    {% if r.status == "Pending" %}
+                                    selected
+                                    {% endif %}
+                                >
+                                    Pending
+                                </option>
+
+                                <option
+                                    {% if r.status == "In Progress" %}
+                                    selected
+                                    {% endif %}
+                                >
+                                    In Progress
+                                </option>
+
+                                <option
+                                    {% if r.status == "Completed" %}
+                                    selected
+                                    {% endif %}
+                                >
+                                    Completed
+                                </option>
+
+                            </select>
+
+                        </form>
+
+
+                        <form
+                            method="POST"
+                            action="/admin/delete/{{ r.id }}"
+                            style="display:inline"
+                            onsubmit="return confirm('Delete this request?')"
+                        >
+
+                            <button class="delete">
+                                Delete
+                            </button>
+
+                        </form>
+
+                    </td>
+
+                </tr>
+
+            {% else %}
+
+                <tr>
+
+                    <td colspan="6">
+                        No requests received yet.
+                    </td>
+
+                </tr>
+
+            {% endfor %}
+
+            </tbody>
+
+        </table>
+
+    </div>
+
+</main>
+
+</body>
+
+</html>
