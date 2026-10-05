@@ -1820,15 +1820,12 @@ body {
 
 <script>
 const KIOSK_ID = "{{ KIOSK_ID }}";
-
 const videos = {{ videos | tojson }};
 
 let language = "en";
 let currentMode = null;
 let currentCard = null;
 let pendingDifferentCard = null;
-
-let screenTimer = null;
 let chargeTimer = null;
 let countdownTimer = null;
 
@@ -1837,20 +1834,14 @@ const video = document.getElementById("backgroundVideo");
 
 
 function setLanguageText() {
-
     document.querySelectorAll("[data-en]").forEach(element => {
-
         element.textContent =
             language === "en"
-            ? element.dataset.en
-            : element.dataset.zh;
-
+                ? element.dataset.en
+                : element.dataset.zh;
     });
 
-    const languageText =
-        language === "en"
-        ? "中文"
-        : "English";
+    const languageText = language === "en" ? "中文" : "English";
 
     document.querySelectorAll(
         "#languageButton, #languageButton2, #languageButton3"
@@ -1870,14 +1861,12 @@ function toggleLanguage() {
 
 
 function showScreen(id) {
-
     document.querySelectorAll(".screen").forEach(screen => {
         screen.classList.remove("active");
     });
 
     document.getElementById(id).classList.add("active");
 
-    clearTimeout(screenTimer);
     clearInterval(countdownTimer);
 
     setLanguageText();
@@ -1885,7 +1874,6 @@ function showScreen(id) {
 
 
 function focusScanner() {
-
     scanner.value = "";
 
     setTimeout(() => {
@@ -1894,31 +1882,24 @@ function focusScanner() {
 }
 
 
-function keepScannerFocused() {
-
-    const scanScreens = [
-        "scanScreen",
-        "confirmCardScreen"
-    ];
-
+setInterval(() => {
     const active = document.querySelector(".screen.active");
 
     if (
         active &&
-        scanScreens.includes(active.id)
+        (
+            active.id === "scanScreen" ||
+            active.id === "confirmCardScreen"
+        )
     ) {
         if (document.activeElement !== scanner) {
             scanner.focus();
         }
     }
-}
-
-
-setInterval(keepScannerFocused, 300);
+}, 300);
 
 
 scanner.addEventListener("keydown", async event => {
-
     if (event.key !== "Enter") {
         return;
     }
@@ -1937,55 +1918,60 @@ scanner.addEventListener("keydown", async event => {
 });
 
 
-function startMode(mode) {
+async function handleCardScan(cardId) {
 
-    currentMode = mode;
+    /*
+        CHARGE FLOW
 
-    if (mode === "charge") {
-        document.getElementById("scanModeTitle").textContent =
-            language === "en" ? "Charge Card" : "充值卡";
+        First scan:
+        Scan screen -> create charge session -> charge screen
+
+        Second scan:
+        Confirm screen -> confirm the same card -> transfer money
+
+        Different card:
+        Show warning -> user chooses Continue -> scan that card again
+    */
+
+    if (currentMode === "charge") {
+
+        const confirmScreen =
+            document.getElementById("confirmCardScreen")
+                .classList.contains("active");
+
+        if (confirmScreen) {
+            await confirmChargeCard(cardId);
+            return;
+        }
+
+        const chargeScreen =
+            document.getElementById("chargeScreen")
+                .classList.contains("active");
+
+        if (chargeScreen) {
+            await beginCardUpdate();
+            return;
+        }
     }
 
-    if (mode === "balance") {
-        document.getElementById("scanModeTitle").textContent =
-            language === "en" ? "Check Balance" : "查询余额";
+    /*
+        DIFFERENT CARD CONFIRMATION
+    */
+
+    if (currentMode === "different-confirm") {
+        await confirmDifferentCard(cardId);
+        return;
     }
 
-    if (mode === "store") {
-        document.getElementById("scanModeTitle").textContent =
-            language === "en" ? "Store" : "商店";
-    }
+    /*
+        NORMAL FIRST CARD SCAN
+    */
 
-    document.getElementById("scanTitle").textContent =
-        language === "en"
-        ? "Please scan your card"
-        : "请扫描您的卡";
-
-    document.getElementById("scanSubtitle").textContent =
-        language === "en"
-        ? "Use the card reader to continue"
-        : "请使用读卡器继续";
-
-    document.getElementById("scanText").textContent =
-        language === "en"
-        ? "Waiting for card"
-        : "等待刷卡";
-
-    showScreen("scanScreen");
-
-    focusScanner();
-
-    startCountdown(
-        30,
-        "scanCountdown",
-        () => goHome()
-    );
+    await firstCardScan(cardId);
 }
 
 
-async function handleCardScan(cardId) {
-
-    clearInterval(countdownTimer);
+async function firstCardScan(cardId) {
 
     currentCard = cardId;
 
@@ -2005,8 +1991,15 @@ async function handleCardScan(cardId) {
 
         const data = await response.json();
 
-        if (!data.success) {
-            showError(data.message || "Unable to scan card");
+        if (!response.ok || !data.success) {
+            showError(
+                data.message ||
+                (
+                    language === "en"
+                        ? "Unable to scan card."
+                        : "无法扫描卡片。"
+                )
+            );
             return;
         }
 
@@ -2024,12 +2017,19 @@ async function handleCardScan(cardId) {
             document.getElementById("chargeBalance")
                 .textContent = data.balance;
 
+            document.getElementById("chargeInstruction")
+                .textContent =
+                    language === "en"
+                        ? "Insert coins"
+                        : "请投入硬币";
+
             showScreen("chargeScreen");
 
             startChargePolling();
 
             return;
         }
+
 
         if (currentMode === "balance") {
 
@@ -2044,11 +2044,12 @@ async function handleCardScan(cardId) {
             startCountdown(
                 10,
                 "balanceCountdown",
-                () => goHome()
+                goHome
             );
 
             return;
         }
+
 
         if (currentMode === "store") {
 
@@ -2066,10 +2067,70 @@ async function handleCardScan(cardId) {
 
         showError(
             language === "en"
-            ? "Unable to connect to the server."
-            : "无法连接到服务器。"
+                ? "Unable to connect to the server."
+                : "无法连接到服务器。"
         );
     }
+}
+
+
+function startMode(mode) {
+
+    currentMode = mode;
+    currentCard = null;
+    pendingDifferentCard = null;
+
+    if (mode === "charge") {
+        document.getElementById("scanModeTitle")
+            .textContent =
+                language === "en"
+                    ? "Charge Card"
+                    : "充值卡";
+    }
+
+    if (mode === "balance") {
+        document.getElementById("scanModeTitle")
+            .textContent =
+                language === "en"
+                    ? "Check Balance"
+                    : "查询余额";
+    }
+
+    if (mode === "store") {
+        document.getElementById("scanModeTitle")
+            .textContent =
+                language === "en"
+                    ? "Store"
+                    : "商店";
+    }
+
+    document.getElementById("scanTitle")
+        .textContent =
+            language === "en"
+                ? "Please scan your card"
+                : "请扫描您的卡";
+
+    document.getElementById("scanSubtitle")
+        .textContent =
+            language === "en"
+                ? "Use the card reader to continue"
+                : "请使用读卡器继续";
+
+    document.getElementById("scanText")
+        .textContent =
+            language === "en"
+                ? "Waiting for card"
+                : "等待刷卡";
+
+    showScreen("scanScreen");
+
+    focusScanner();
+
+    startCountdown(
+        30,
+        "scanCountdown",
+        goHome
+    );
 }
 
 
@@ -2106,42 +2167,24 @@ function startChargePolling() {
 
                 document.getElementById("chargeInstruction")
                     .textContent =
-                    language === "en"
-                    ? "Tap your card again to update it"
-                    : "请再次刷卡以更新余额";
+                        language === "en"
+                            ? "Tap your card again to update it"
+                            : "请再次刷卡以更新余额";
             }
 
         } catch (error) {
+            console.log("Charge state update failed");
         }
 
     }, 500);
 }
 
 
-async function cancelCharge() {
-
-    clearInterval(chargeTimer);
-
-    try {
-
-        await fetch("/api/kiosk/end", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                kiosk_id: KIOSK_ID
-            })
-        });
-
-    } catch (error) {
-    }
-
-    goHome();
-}
-
-
-async function finishCharge() {
+/*
+    Called when the user scans again after
+    inserting coins.
+*/
+async function beginCardUpdate() {
 
     clearInterval(chargeTimer);
 
@@ -2152,48 +2195,78 @@ async function finishCharge() {
             encodeURIComponent(KIOSK_ID)
         );
 
-        const state = await response.json();
+        const data = await response.json();
 
-        if (!state.active) {
+        if (!data.active) {
+
             showError(
                 language === "en"
-                ? "The charge session has ended."
-                : "充值会话已结束。"
+                    ? "The charge session has ended."
+                    : "充值会话已结束。"
             );
+
             return;
         }
 
-        if (state.amount_cents <= 0) {
+        if (data.amount_cents <= 0) {
+
             showError(
                 language === "en"
-                ? "Please insert coins first."
-                : "请先投入硬币。"
+                    ? "Please insert coins first."
+                    : "请先投入硬币。"
             );
+
+            startCountdown(
+                5,
+                "scanCountdown",
+                () => {
+                    showScreen("chargeScreen");
+                    startChargePolling();
+                }
+            );
+
             return;
         }
 
         showScreen("confirmCardScreen");
+
+        document.querySelector(
+            "#confirmCardScreen .title"
+        ).textContent =
+            language === "en"
+                ? "Tap your card again"
+                : "请再次刷卡";
+
+        document.querySelector(
+            "#confirmCardScreen .subtitle"
+        ).textContent =
+            language === "en"
+                ? "Tap the card used for this charge."
+                : "请刷入本次充值使用的卡。";
 
         focusScanner();
 
         startCountdown(
             30,
             "confirmCountdown",
-            () => cancelCharge()
+            cancelCharge
         );
 
     } catch (error) {
 
         showError(
             language === "en"
-            ? "Unable to continue."
-            : "无法继续。"
+                ? "Unable to check the charge."
+                : "无法检查充值状态。"
         );
     }
 }
 
 
-async function confirmCard(cardId) {
+/*
+    The second scan.
+*/
+async function confirmChargeCard(cardId) {
 
     try {
 
@@ -2213,20 +2286,31 @@ async function confirmCard(cardId) {
 
         const data = await response.json();
 
-        if (data.success) {
+        /*
+            SAME CARD
+        */
+
+        if (response.ok && data.success) {
+
+            currentCard = data.card_id;
 
             showSuccess(
                 language === "en"
-                ? "Card updated successfully"
-                : "卡片更新成功",
+                    ? "Card updated successfully"
+                    : "卡片更新成功",
                 data.added,
                 language === "en"
-                ? "New balance: " + data.balance
-                : "新余额：" + data.balance
+                    ? "New balance: " + data.balance
+                    : "新余额：" + data.balance
             );
 
             return;
         }
+
+
+        /*
+            DIFFERENT CARD
+        */
 
         if (data.different_card) {
 
@@ -2243,58 +2327,75 @@ async function confirmCard(cardId) {
             startCountdown(
                 20,
                 "differentCountdown",
-                () => cancelCharge()
+                cancelCharge
             );
 
             return;
         }
 
-        showError(data.message || "Unable to update card");
+
+        showError(
+            data.message ||
+            (
+                language === "en"
+                    ? "Unable to update card."
+                    : "无法更新卡片。"
+            )
+        );
 
     } catch (error) {
 
         showError(
             language === "en"
-            ? "Unable to connect to the server."
-            : "无法连接到服务器。"
+                ? "Unable to connect to the server."
+                : "无法连接到服务器。"
         );
     }
 }
 
 
-async function continueDifferentCard() {
+/*
+    User chose CONTINUE after
+    a different card was detected.
+*/
+function continueDifferentCard() {
 
     if (!pendingDifferentCard) {
         return;
     }
 
+    currentMode = "different-confirm";
+
     showScreen("confirmCardScreen");
 
-    document.querySelector("#confirmCardScreen .title")
-        .textContent =
+    document.querySelector(
+        "#confirmCardScreen .title"
+    ).textContent =
         language === "en"
-        ? "Tap the new card again"
-        : "请再次刷新的卡";
+            ? "Tap the new card again"
+            : "请再次刷这张新卡";
 
-    document.querySelector("#confirmCardScreen .subtitle")
-        .textContent =
+    document.querySelector(
+        "#confirmCardScreen .subtitle"
+    ).textContent =
         language === "en"
-        ? "Tap the same card again to confirm."
-        : "请再次刷同一张卡以确认。";
+            ? "Tap the same card again to confirm."
+            : "请再次刷同一张卡以确认。";
 
     focusScanner();
 
     startCountdown(
         30,
         "confirmCountdown",
-        () => cancelCharge()
+        cancelCharge
     );
-
-    currentMode = "different-confirm";
 }
 
 
-async function handleDifferentCardConfirmation(cardId) {
+/*
+    Confirms the DIFFERENT card twice.
+*/
+async function confirmDifferentCard(cardId) {
 
     if (cardId !== pendingDifferentCard) {
 
@@ -2309,7 +2410,7 @@ async function handleDifferentCardConfirmation(cardId) {
         startCountdown(
             20,
             "differentCountdown",
-            () => cancelCharge()
+            cancelCharge
         );
 
         return;
@@ -2333,28 +2434,38 @@ async function handleDifferentCardConfirmation(cardId) {
 
         const data = await response.json();
 
-        if (!data.success) {
+        if (!response.ok || !data.success) {
 
-            showError(data.message || "Unable to update card");
+            showError(
+                data.message ||
+                (
+                    language === "en"
+                        ? "Unable to update card."
+                        : "无法更新卡片。"
+                )
+            );
+
             return;
         }
 
+        currentCard = data.card_id;
+
         showSuccess(
             language === "en"
-            ? "Card updated successfully"
-            : "卡片更新成功",
+                ? "Card updated successfully"
+                : "卡片更新成功",
             data.added,
             language === "en"
-            ? "New balance: " + data.balance
-            : "新余额：" + data.balance
+                ? "New balance: " + data.balance
+                : "新余额：" + data.balance
         );
 
     } catch (error) {
 
         showError(
             language === "en"
-            ? "Unable to connect to the server."
-            : "无法连接到服务器。"
+                ? "Unable to connect to the server."
+                : "无法连接到服务器。"
         );
     }
 }
@@ -2388,7 +2499,7 @@ async function loadProducts() {
                 </div>
 
                 <div class="product-price">
-                    ${product.price}
+                    ${escapeHtml(product.price)}
                 </div>
 
                 <button>
@@ -2407,14 +2518,15 @@ async function loadProducts() {
 
     } catch (error) {
 
-        container.innerHTML =
-            `<div class="subtitle">
+        container.innerHTML = `
+            <div class="subtitle">
                 ${
                     language === "en"
-                    ? "Unable to load products."
-                    : "无法加载商品。"
+                        ? "Unable to load products."
+                        : "无法加载商品。"
                 }
-            </div>`;
+            </div>
+        `;
     }
 }
 
@@ -2446,40 +2558,37 @@ async function buyProduct(productId) {
         const data =
             await response.json();
 
-        buttons.forEach(button => {
-            button.disabled = false;
-        });
-
         if (data.success) {
-
-            document.getElementById("storeBalance")
-                .textContent = data.balance;
 
             showSuccess(
                 language === "en"
-                ? "Purchase complete"
-                : "购买完成",
+                    ? "Purchase complete"
+                    : "购买完成",
                 data.price,
                 language === "en"
-                ? "Remaining balance: " + data.balance
-                : "剩余余额：" + data.balance
+                    ? "Remaining balance: " + data.balance
+                    : "剩余余额：" + data.balance
             );
 
             return;
         }
 
+        buttons.forEach(button => {
+            button.disabled = false;
+        });
+
         if (data.insufficient) {
 
             showError(
                 language === "en"
-                ? "Insufficient balance. You have " +
-                  data.balance +
-                  " but need " +
-                  data.required + "."
-                : "余额不足。当前余额 " +
-                  data.balance +
-                  "，需要 " +
-                  data.required + "。"
+                    ? "Insufficient balance. You have " +
+                      data.balance +
+                      " but need " +
+                      data.required + "."
+                    : "余额不足。当前余额 " +
+                      data.balance +
+                      "，需要 " +
+                      data.required + "。"
             );
 
             return;
@@ -2495,116 +2604,34 @@ async function buyProduct(productId) {
 
         showError(
             language === "en"
-            ? "Unable to connect to the server."
-            : "无法连接到服务器。"
+                ? "Unable to connect to the server."
+                : "无法连接到服务器。"
         );
     }
 }
 
 
-async function handleCardScan(cardId) {
+async function cancelCharge() {
 
-    if (currentMode === "different-confirm") {
-        await handleDifferentCardConfirmation(cardId);
-        return;
-    }
-
-    if (currentMode === "charge") {
-
-        const active =
-            document.getElementById("chargeScreen")
-                .classList.contains("active");
-
-        if (active) {
-            await finishCharge();
-            return;
-        }
-
-        await confirmCard(cardId);
-        return;
-    }
-
-    await originalCardScan(cardId);
-}
-
-
-async function originalCardScan(cardId) {
-
-    currentCard = cardId;
+    clearInterval(chargeTimer);
+    clearInterval(countdownTimer);
 
     try {
 
-        const response = await fetch("/api/kiosk/scan", {
+        await fetch("/api/kiosk/end", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                kiosk_id: KIOSK_ID,
-                card_id: cardId,
-                mode: currentMode
+                kiosk_id: KIOSK_ID
             })
         });
 
-        const data = await response.json();
-
-        if (!data.success) {
-            showError(data.message || "Unable to scan card");
-            return;
-        }
-
-        if (currentMode === "charge") {
-
-            document.getElementById("chargeCardId")
-                .textContent = data.card_id;
-
-            document.getElementById("chargeAmount")
-                .textContent = "$0.00";
-
-            document.getElementById("chargeCoins")
-                .textContent = "0";
-
-            document.getElementById("chargeBalance")
-                .textContent = data.balance;
-
-            showScreen("chargeScreen");
-
-            startChargePolling();
-
-        } else if (currentMode === "balance") {
-
-            document.getElementById("balanceAmount")
-                .textContent = data.balance;
-
-            document.getElementById("balanceCard")
-                .textContent = data.card_id;
-
-            showScreen("balanceScreen");
-
-            startCountdown(
-                10,
-                "balanceCountdown",
-                () => goHome()
-            );
-
-        } else if (currentMode === "store") {
-
-            document.getElementById("storeBalance")
-                .textContent = data.balance;
-
-            await loadProducts();
-
-            showScreen("storeScreen");
-        }
-
     } catch (error) {
-
-        showError(
-            language === "en"
-            ? "Unable to connect to the server."
-            : "无法连接到服务器。"
-        );
     }
+
+    goHome(false);
 }
 
 
@@ -2617,18 +2644,11 @@ function startCountdown(seconds, elementId, callback) {
     const element =
         document.getElementById(elementId);
 
+    if (!element) {
+        return;
+    }
+
     function update() {
-
-        if (!element) {
-            return;
-        }
-
-        element.textContent =
-            language === "en"
-            ? "Returning in " + remaining + " seconds"
-            : remaining + " 秒后返回";
-
-        remaining--;
 
         if (remaining < 0) {
 
@@ -2637,7 +2657,16 @@ function startCountdown(seconds, elementId, callback) {
             if (callback) {
                 callback();
             }
+
+            return;
         }
+
+        element.textContent =
+            language === "en"
+                ? "Returning in " + remaining + " seconds"
+                : remaining + " 秒后返回";
+
+        remaining--;
     }
 
     update();
@@ -2650,6 +2679,7 @@ function startCountdown(seconds, elementId, callback) {
 function showSuccess(title, amount, message) {
 
     clearInterval(chargeTimer);
+    clearInterval(countdownTimer);
 
     document.getElementById("successTitle")
         .textContent = title;
@@ -2659,9 +2689,9 @@ function showSuccess(title, amount, message) {
 
     document.getElementById("successMessage")
         .textContent =
-        language === "en"
-        ? "Transaction complete"
-        : "交易完成";
+            language === "en"
+                ? "Transaction complete"
+                : "交易完成";
 
     document.getElementById("successBalance")
         .textContent = message;
@@ -2671,7 +2701,7 @@ function showSuccess(title, amount, message) {
     startCountdown(
         8,
         "successCountdown",
-        () => goHome()
+        () => goHome(false)
     );
 }
 
@@ -2691,7 +2721,9 @@ function goBack() {
 
     clearInterval(countdownTimer);
 
-    if (currentMode === "charge") {
+    if (currentMode === "charge" ||
+        currentMode === "different-confirm") {
+
         cancelCharge();
         return;
     }
@@ -2700,7 +2732,7 @@ function goBack() {
 }
 
 
-function goHome() {
+function goHome(endServerSession = true) {
 
     clearInterval(chargeTimer);
     clearInterval(countdownTimer);
@@ -2709,15 +2741,18 @@ function goHome() {
     pendingDifferentCard = null;
     currentMode = null;
 
-    fetch("/api/kiosk/end", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-            kiosk_id: KIOSK_ID
-        })
-    }).catch(() => {});
+    if (endServerSession) {
+
+        fetch("/api/kiosk/end", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                kiosk_id: KIOSK_ID
+            })
+        }).catch(() => {});
+    }
 
     showScreen("homeScreen");
 }
@@ -2736,7 +2771,7 @@ function escapeHtml(value) {
 
 function startBackgroundVideo() {
 
-    if (!videos.length) {
+    if (!videos || videos.length === 0) {
         return;
     }
 
@@ -2745,7 +2780,6 @@ function startBackgroundVideo() {
     function loadVideo() {
 
         video.src = videos[index];
-
         video.load();
 
         video.play().catch(() => {});
@@ -2794,40 +2828,6 @@ document.addEventListener("click", () => {
     }
 
 }, true);
-
-
-setInterval(() => {
-
-    if (
-        document.getElementById("chargeScreen")
-            .classList.contains("active")
-    ) {
-
-        fetch(
-            "/api/kiosk/state?kiosk_id=" +
-            encodeURIComponent(KIOSK_ID)
-        )
-        .then(response => response.json())
-        .then(data => {
-
-            if (
-                data.active &&
-                data.amount_cents > 0
-            ) {
-
-                document.getElementById(
-                    "chargeInstruction"
-                ).textContent =
-                    language === "en"
-                    ? "Tap your card again to update it"
-                    : "请再次刷卡以更新余额";
-            }
-
-        })
-        .catch(() => {});
-    }
-
-}, 1000);
 
 
 setLanguageText();
