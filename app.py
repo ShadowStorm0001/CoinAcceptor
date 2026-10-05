@@ -1,15 +1,25 @@
 import os
 import sqlite3
 import threading
-import time
+import secrets
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request, render_template_string, session, redirect, url_for
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    render_template_string,
+    session,
+    redirect,
+    url_for
+)
 
 app = Flask(__name__)
 
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "change-this-secret-key"
+)
 
 KIOSK_ID = "KIOSK1"
 COIN_VALUE_CENTS = 100
@@ -17,55 +27,60 @@ COIN_VALUE_CENTS = 100
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
 
-# ------------------------------------------------------------
-# DATABASE
-# ------------------------------------------------------------
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 if DATABASE_URL:
     import psycopg2
-    import psycopg2.extras
 
     if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        DATABASE_URL = DATABASE_URL.replace(
+            "postgres://",
+            "postgresql://",
+            1
+        )
 
     DB_TYPE = "postgres"
 else:
     DB_TYPE = "sqlite"
-
-    # Local development database.
-    # On Render, use PostgreSQL for persistence.
-    DB_FILE = os.environ.get("DB_FILE", "kiosk.db")
-
-
-def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ------------------------------------------------------------
-# DATABASE HELPERS
-# ------------------------------------------------------------
+    DB_FILE = os.environ.get(
+        "DB_FILE",
+        "kiosk.db"
+    )
 
 db_lock = threading.RLock()
 
 
+# ============================================================
+# DATABASE
+# ============================================================
+
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def get_db():
+
     if DB_TYPE == "postgres":
-        conn = psycopg2.connect(DATABASE_URL)
+
+        conn = psycopg2.connect(
+            DATABASE_URL
+        )
+
         conn.autocommit = False
+
         return conn
 
-    conn = sqlite3.connect(
+    return sqlite3.connect(
         DB_FILE,
         timeout=30,
         check_same_thread=False
     )
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def close_db(conn):
+
     try:
         conn.close()
     except Exception:
@@ -73,13 +88,17 @@ def close_db(conn):
 
 
 def init_db():
+
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
 
             if DB_TYPE == "postgres":
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS cards (
                         card_id TEXT PRIMARY KEY,
@@ -137,10 +156,25 @@ def init_db():
                         active INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS receipts (
+                        id SERIAL PRIMARY KEY,
+                        receipt_number TEXT UNIQUE NOT NULL,
+                        kiosk_id TEXT NOT NULL,
+                        card_id TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        amount_cents INTEGER NOT NULL,
+                        balance_after_cents INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
                     )
                 """)
 
             else:
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS cards (
                         card_id TEXT PRIMARY KEY,
@@ -198,20 +232,38 @@ def init_db():
                         active INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS receipts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        receipt_number TEXT UNIQUE NOT NULL,
+                        kiosk_id TEXT NOT NULL,
+                        card_id TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        amount_cents INTEGER NOT NULL,
+                        balance_after_cents INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
                     )
                 """)
 
             conn.commit()
 
-            # Add default products only if none exist.
             if DB_TYPE == "postgres":
-                cur.execute("SELECT COUNT(*) FROM products")
+                cur.execute(
+                    "SELECT COUNT(*) FROM products"
+                )
             else:
-                cur.execute("SELECT COUNT(*) AS count FROM products")
+                cur.execute(
+                    "SELECT COUNT(*) FROM products"
+                )
 
             count = cur.fetchone()[0]
 
             if count == 0:
+
                 now = utc_now()
 
                 defaults = [
@@ -221,18 +273,44 @@ def init_db():
                 ]
 
                 for name, price in defaults:
+
                     if DB_TYPE == "postgres":
+
                         cur.execute("""
                             INSERT INTO products
-                            (name, price_cents, active, created_at, updated_at)
+                            (
+                                name,
+                                price_cents,
+                                active,
+                                created_at,
+                                updated_at
+                            )
                             VALUES (%s, %s, 1, %s, %s)
-                        """, (name, price, now, now))
+                        """, (
+                            name,
+                            price,
+                            now,
+                            now
+                        ))
+
                     else:
+
                         cur.execute("""
                             INSERT INTO products
-                            (name, price_cents, active, created_at, updated_at)
+                            (
+                                name,
+                                price_cents,
+                                active,
+                                created_at,
+                                updated_at
+                            )
                             VALUES (?, ?, 1, ?, ?)
-                        """, (name, price, now, now))
+                        """, (
+                            name,
+                            price,
+                            now,
+                            now
+                        ))
 
                 conn.commit()
 
@@ -244,65 +322,102 @@ init_db()
 
 
 def query_one(sql, params=()):
+
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
-
-            if DB_TYPE == "postgres":
-                cur.execute(sql, params)
-                row = cur.fetchone()
-
-                if row is None:
-                    return None
-
-                columns = [d[0] for d in cur.description]
-                return dict(zip(columns, row))
-
             cur.execute(sql, params)
+
             row = cur.fetchone()
 
-            return dict(row) if row else None
+            if not row:
+                return None
+
+            if DB_TYPE == "postgres":
+
+                columns = [
+                    item[0]
+                    for item in cur.description
+                ]
+
+                return dict(
+                    zip(columns, row)
+                )
+
+            return dict(row)
 
         finally:
             close_db(conn)
 
 
 def query_all(sql, params=()):
+
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
+            cur.execute(sql, params)
+
+            rows = cur.fetchall()
 
             if DB_TYPE == "postgres":
-                cur.execute(sql, params)
-                rows = cur.fetchall()
-                columns = [d[0] for d in cur.description]
-                return [dict(zip(columns, row)) for row in rows]
 
-            cur.execute(sql, params)
-            return [dict(row) for row in cur.fetchall()]
+                columns = [
+                    item[0]
+                    for item in cur.description
+                ]
+
+                return [
+                    dict(zip(columns, row))
+                    for row in rows
+                ]
+
+            columns = [
+                item[0]
+                for item in cur.description
+            ]
+
+            return [
+                dict(zip(columns, row))
+                for row in rows
+            ]
 
         finally:
             close_db(conn)
 
 
 def execute(sql, params=()):
+
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
             cur.execute(sql, params)
+
             conn.commit()
 
             if DB_TYPE == "postgres":
+
                 try:
-                    return cur.fetchone()
+                    row = cur.fetchone()
+
+                    if row:
+                        return row[0]
+
                 except Exception:
-                    return None
+                    pass
+
+                return None
 
             return cur.lastrowid
 
@@ -310,53 +425,160 @@ def execute(sql, params=()):
             close_db(conn)
 
 
-# ------------------------------------------------------------
-# COMMON FUNCTIONS
-# ------------------------------------------------------------
-
 def money(cents):
+
     return f"${cents / 100:.2f}"
 
 
-def ensure_card(card_id):
-    card_id = str(card_id).strip()
+# ============================================================
+# MACHINE LOG
+# ============================================================
 
-    if not card_id:
-        return None
-
-    existing = query_one(
-        "SELECT * FROM cards WHERE card_id = ?" if DB_TYPE == "sqlite"
-        else "SELECT * FROM cards WHERE card_id = %s",
-        (card_id,)
-    )
-
-    if existing:
-        return existing
+def create_machine_log(
+    event_type,
+    message,
+    card_id=None,
+    amount_cents=0
+):
 
     now = utc_now()
 
     if DB_TYPE == "sqlite":
-        execute("""
-            INSERT INTO cards
-            (card_id, balance_cents, created_at, updated_at)
-            VALUES (?, 0, ?, ?)
-        """, (card_id, now, now))
-    else:
-        execute("""
-            INSERT INTO cards
-            (card_id, balance_cents, created_at, updated_at)
-            VALUES (%s, 0, %s, %s)
-        """, (card_id, now, now))
 
-    return query_one(
-        "SELECT * FROM cards WHERE card_id = ?" if DB_TYPE == "sqlite"
-        else "SELECT * FROM cards WHERE card_id = %s",
-        (card_id,)
+        execute("""
+            INSERT INTO transactions
+            (
+                kiosk_id,
+                card_id,
+                type,
+                amount_cents,
+                coins,
+                description,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+        """, (
+            KIOSK_ID,
+            card_id or "-",
+            "SYSTEM_" + event_type,
+            amount_cents,
+            message,
+            now
+        ))
+
+    else:
+
+        execute("""
+            INSERT INTO transactions
+            (
+                kiosk_id,
+                card_id,
+                type,
+                amount_cents,
+                coins,
+                description,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s, 0, %s, %s)
+        """, (
+            KIOSK_ID,
+            card_id or "-",
+            "SYSTEM_" + event_type,
+            amount_cents,
+            message,
+            now
+        ))
+
+
+# ============================================================
+# CARDS
+# ============================================================
+
+def ensure_card(card_id):
+
+    card_id = str(
+        card_id
+    ).strip()
+
+    if not card_id:
+        return None
+
+    if DB_TYPE == "sqlite":
+
+        card = query_one("""
+            SELECT *
+            FROM cards
+            WHERE card_id = ?
+        """, (
+            card_id,
+        ))
+
+    else:
+
+        card = query_one("""
+            SELECT *
+            FROM cards
+            WHERE card_id = %s
+        """, (
+            card_id,
+        ))
+
+    if card:
+        return card
+
+    now = utc_now()
+
+    if DB_TYPE == "sqlite":
+
+        execute("""
+            INSERT INTO cards
+            (
+                card_id,
+                balance_cents,
+                created_at,
+                updated_at
+            )
+            VALUES (?, 0, ?, ?)
+        """, (
+            card_id,
+            now,
+            now
+        ))
+
+    else:
+
+        execute("""
+            INSERT INTO cards
+            (
+                card_id,
+                balance_cents,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, 0, %s, %s)
+        """, (
+            card_id,
+            now,
+            now
+        ))
+
+    create_machine_log(
+        "CARD_CREATED",
+        "New card created",
+        card_id
     )
 
+    return ensure_card(card_id)
+
+
+# ============================================================
+# SESSIONS
+# ============================================================
 
 def get_active_session():
+
     if DB_TYPE == "sqlite":
+
         return query_one("""
             SELECT *
             FROM sessions
@@ -364,7 +586,9 @@ def get_active_session():
             AND status = 'active'
             ORDER BY id DESC
             LIMIT 1
-        """, (KIOSK_ID,))
+        """, (
+            KIOSK_ID,
+        ))
 
     return query_one("""
         SELECT *
@@ -373,112 +597,288 @@ def get_active_session():
         AND status = 'active'
         ORDER BY id DESC
         LIMIT 1
-    """, (KIOSK_ID,))
+    """, (
+        KIOSK_ID,
+    ))
 
 
 def close_active_session():
+
     now = utc_now()
 
     if DB_TYPE == "sqlite":
+
         execute("""
             UPDATE sessions
             SET status = 'cancelled',
                 updated_at = ?
             WHERE kiosk_id = ?
             AND status = 'active'
-        """, (now, KIOSK_ID))
+        """, (
+            now,
+            KIOSK_ID
+        ))
+
     else:
+
         execute("""
             UPDATE sessions
             SET status = 'cancelled',
                 updated_at = %s
             WHERE kiosk_id = %s
             AND status = 'active'
-        """, (now, KIOSK_ID))
+        """, (
+            now,
+            KIOSK_ID
+        ))
 
 
-# ------------------------------------------------------------
+# ============================================================
+# RECEIPTS
+# ============================================================
+
+def create_receipt(
+    card_id,
+    receipt_type,
+    description,
+    amount_cents,
+    balance_after_cents
+):
+
+    now = utc_now()
+
+    receipt_number = (
+        "R-"
+        + datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y%m%d%H%M%S"
+        )
+        + "-"
+        + secrets.token_hex(
+            3
+        ).upper()
+    )
+
+    if DB_TYPE == "sqlite":
+
+        execute("""
+            INSERT INTO receipts
+            (
+                receipt_number,
+                kiosk_id,
+                card_id,
+                type,
+                description,
+                amount_cents,
+                balance_after_cents,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            receipt_number,
+            KIOSK_ID,
+            card_id,
+            receipt_type,
+            description,
+            amount_cents,
+            balance_after_cents,
+            now
+        ))
+
+    else:
+
+        execute("""
+            INSERT INTO receipts
+            (
+                receipt_number,
+                kiosk_id,
+                card_id,
+                type,
+                description,
+                amount_cents,
+                balance_after_cents,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            receipt_number,
+            KIOSK_ID,
+            card_id,
+            receipt_type,
+            description,
+            amount_cents,
+            balance_after_cents,
+            now
+        ))
+
+    return {
+        "receipt_number": receipt_number,
+        "created_at": now,
+        "card_id": card_id,
+        "type": receipt_type,
+        "description": description,
+        "amount_cents": amount_cents,
+        "amount": money(amount_cents),
+        "balance_after_cents":
+            balance_after_cents,
+        "balance_after":
+            money(balance_after_cents)
+    }
+
+
+# ============================================================
 # KIOSK
-# ------------------------------------------------------------
+# ============================================================
 
 @app.route("/")
 def index():
-    return redirect(url_for("kiosk"))
+
+    return redirect(
+        url_for("kiosk")
+    )
 
 
 @app.route("/kiosk")
 def kiosk():
+
     return render_template_string(
         KIOSK_HTML,
         KIOSK_ID=KIOSK_ID
     )
 
 
-@app.route("/api/kiosk/scan", methods=["POST"])
+@app.route(
+    "/api/kiosk/scan",
+    methods=["POST"]
+)
 def kiosk_scan():
-    data = request.get_json(silent=True) or {}
 
-    card_id = str(data.get("card_id", "")).strip()
-    mode = str(data.get("mode", "")).strip().lower()
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    card_id = str(
+        data.get(
+            "card_id",
+            ""
+        )
+    ).strip()
+
+    mode = str(
+        data.get(
+            "mode",
+            ""
+        )
+    ).strip().lower()
 
     if not card_id:
+
         return jsonify({
             "success": False,
             "error": "CARD_REQUIRED"
         }), 400
 
-    if mode not in ("charge", "balance", "store"):
+    if mode not in (
+        "charge",
+        "balance",
+        "store"
+    ):
+
         return jsonify({
             "success": False,
             "error": "INVALID_MODE"
         }), 400
 
-    card = ensure_card(card_id)
+    card = ensure_card(
+        card_id
+    )
+
+    create_machine_log(
+        "CARD_SCAN",
+        f"Card scanned in {mode} mode",
+        card_id
+    )
 
     if mode == "charge":
 
-        # Do not leave an old session hanging around.
         close_active_session()
 
         now = utc_now()
 
         if DB_TYPE == "sqlite":
-            execute("""
-                INSERT INTO sessions
-                (kiosk_id, card_id, mode, status,
-                 coin_count, amount_cents, created_at, updated_at)
-                VALUES (?, ?, 'charge', 'active', 0, 0, ?, ?)
-            """, (KIOSK_ID, card_id, now, now))
-        else:
-            execute("""
-                INSERT INTO sessions
-                (kiosk_id, card_id, mode, status,
-                 coin_count, amount_cents, created_at, updated_at)
-                VALUES (%s, %s, 'charge', 'active', 0, 0, %s, %s)
-            """, (KIOSK_ID, card_id, now, now))
 
-        return jsonify({
-            "success": True,
-            "card_id": card_id,
-            "balance_cents": card["balance_cents"],
-            "balance": money(card["balance_cents"]),
-            "mode": "charge"
-        })
+            execute("""
+                INSERT INTO sessions
+                (
+                    kiosk_id,
+                    card_id,
+                    mode,
+                    status,
+                    coin_count,
+                    amount_cents,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'charge', 'active', 0, 0, ?, ?)
+            """, (
+                KIOSK_ID,
+                card_id,
+                now,
+                now
+            ))
+
+        else:
+
+            execute("""
+                INSERT INTO sessions
+                (
+                    kiosk_id,
+                    card_id,
+                    mode,
+                    status,
+                    coin_count,
+                    amount_cents,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, 'charge', 'active', 0, 0, %s, %s)
+            """, (
+                KIOSK_ID,
+                card_id,
+                now,
+                now
+            ))
+
+        create_machine_log(
+            "SESSION_STARTED",
+            "Charge session started",
+            card_id
+        )
 
     return jsonify({
         "success": True,
         "card_id": card_id,
-        "balance_cents": card["balance_cents"],
-        "balance": money(card["balance_cents"]),
+        "balance_cents":
+            card["balance_cents"],
+        "balance":
+            money(
+                card["balance_cents"]
+            ),
         "mode": mode
     })
 
 
 @app.route("/api/kiosk/state")
 def kiosk_state():
+
     active = get_active_session()
 
     if not active:
+
         return jsonify({
             "success": True,
             "active": False
@@ -490,15 +890,35 @@ def kiosk_state():
         "session": {
             "id": active["id"],
             "card_id": active["card_id"],
-            "coin_count": active["coin_count"],
-            "amount_cents": active["amount_cents"],
-            "amount": money(active["amount_cents"])
+            "coin_count":
+                active["coin_count"],
+            "amount_cents":
+                active["amount_cents"],
+            "amount":
+                money(
+                    active["amount_cents"]
+                )
         }
     })
 
 
-@app.route("/api/kiosk/end", methods=["POST"])
+@app.route(
+    "/api/kiosk/end",
+    methods=["POST"]
+)
 def kiosk_end():
+
+    active = get_active_session()
+
+    if active:
+
+        create_machine_log(
+            "SESSION_ENDED",
+            "Charge session cancelled",
+            active["card_id"],
+            active["amount_cents"]
+        )
+
     close_active_session()
 
     return jsonify({
@@ -506,29 +926,65 @@ def kiosk_end():
     })
 
 
-# ------------------------------------------------------------
+# ============================================================
 # COIN RECEIVER
-# ------------------------------------------------------------
+# ============================================================
 
-@app.route("/api/coin", methods=["POST"])
+@app.route(
+    "/api/coin",
+    methods=["POST"]
+)
 def coin():
-    data = request.get_json(silent=True) or {}
 
-    kiosk_id = str(data.get("kiosk_id", "")).strip()
-    coins = int(data.get("coins", 1))
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    kiosk_id = str(
+        data.get(
+            "kiosk_id",
+            ""
+        )
+    ).strip()
+
+    try:
+
+        coins = int(
+            data.get(
+                "coins",
+                1
+            )
+        )
+
+    except Exception:
+
+        coins = 1
 
     if coins < 1:
         coins = 1
 
-    # The Pi MUST identify itself as KIOSK1.
+    amount = (
+        coins *
+        COIN_VALUE_CENTS
+    )
+
     if kiosk_id != KIOSK_ID:
-        execute_coin_event(
-            kiosk_id=kiosk_id or "UNKNOWN",
-            card_id=None,
-            accepted=0,
-            coins=coins,
-            amount_cents=coins * COIN_VALUE_CENTS,
-            reason="INVALID_KIOSK_ID"
+
+        record_coin_event(
+            kiosk_id or "UNKNOWN",
+            None,
+            0,
+            coins,
+            amount,
+            "INVALID_KIOSK_ID"
+        )
+
+        create_machine_log(
+            "COIN_REJECTED",
+            "Invalid kiosk ID"
         )
 
         return jsonify({
@@ -538,40 +994,58 @@ def coin():
 
     active = get_active_session()
 
-    # Always record the physical coin event.
     if not active:
-        execute_coin_event(
-            kiosk_id=KIOSK_ID,
-            card_id=None,
-            accepted=0,
-            coins=coins,
-            amount_cents=coins * COIN_VALUE_CENTS,
-            reason="NO_ACTIVE_CARD_SESSION"
+
+        record_coin_event(
+            KIOSK_ID,
+            None,
+            0,
+            coins,
+            amount,
+            "NO_ACTIVE_CARD_SESSION"
+        )
+
+        create_machine_log(
+            "COIN_REJECTED",
+            "Coin received with no active card session",
+            None,
+            amount
         )
 
         return jsonify({
             "success": False,
-            "error": "NO_ACTIVE_CARD_SESSION",
-            "message": "No active charge session."
+            "error":
+                "NO_ACTIVE_CARD_SESSION",
+            "message":
+                "No active charge session."
         }), 409
 
-    new_count = active["coin_count"] + coins
-    new_amount = active["amount_cents"] + (
-        coins * COIN_VALUE_CENTS
+    new_count = (
+        active["coin_count"]
+        + coins
+    )
+
+    new_amount = (
+        active["amount_cents"]
+        + amount
     )
 
     now = utc_now()
 
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
 
             if DB_TYPE == "sqlite":
+
                 cur.execute("""
                     UPDATE sessions
-                    SET coin_count = ?,
+                    SET
+                        coin_count = ?,
                         amount_cents = ?,
                         updated_at = ?
                     WHERE id = ?
@@ -584,10 +1058,34 @@ def coin():
                     active["id"],
                     KIOSK_ID
                 ))
+
+                cur.execute("""
+                    INSERT INTO coin_events
+                    (
+                        kiosk_id,
+                        card_id,
+                        accepted,
+                        coins,
+                        amount_cents,
+                        reason,
+                        created_at
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?)
+                """, (
+                    KIOSK_ID,
+                    active["card_id"],
+                    coins,
+                    amount,
+                    "ACCEPTED",
+                    now
+                ))
+
             else:
+
                 cur.execute("""
                     UPDATE sessions
-                    SET coin_count = %s,
+                    SET
+                        coin_count = %s,
                         amount_cents = %s,
                         updated_at = %s
                     WHERE id = %s
@@ -601,52 +1099,59 @@ def coin():
                     KIOSK_ID
                 ))
 
-            if DB_TYPE == "sqlite":
                 cur.execute("""
                     INSERT INTO coin_events
-                    (kiosk_id, card_id, accepted, coins,
-                     amount_cents, reason, created_at)
-                    VALUES (?, ?, 1, ?, ?, 'ACCEPTED', ?)
+                    (
+                        kiosk_id,
+                        card_id,
+                        accepted,
+                        coins,
+                        amount_cents,
+                        reason,
+                        created_at
+                    )
+                    VALUES (%s, %s, 1, %s, %s, %s, %s)
                 """, (
                     KIOSK_ID,
                     active["card_id"],
                     coins,
-                    coins * COIN_VALUE_CENTS,
-                    now
-                ))
-            else:
-                cur.execute("""
-                    INSERT INTO coin_events
-                    (kiosk_id, card_id, accepted, coins,
-                     amount_cents, reason, created_at)
-                    VALUES (%s, %s, 1, %s, %s, 'ACCEPTED', %s)
-                """, (
-                    KIOSK_ID,
-                    active["card_id"],
-                    coins,
-                    coins * COIN_VALUE_CENTS,
+                    amount,
+                    "ACCEPTED",
                     now
                 ))
 
             conn.commit()
 
         except Exception:
+
             conn.rollback()
             raise
 
         finally:
+
             close_db(conn)
+
+    create_machine_log(
+        "COIN",
+        "Coin accepted",
+        active["card_id"],
+        amount
+    )
 
     return jsonify({
         "success": True,
-        "card_id": active["card_id"],
-        "coins": new_count,
-        "amount_cents": new_amount,
-        "amount": money(new_amount)
+        "card_id":
+            active["card_id"],
+        "coins":
+            new_count,
+        "amount_cents":
+            new_amount,
+        "amount":
+            money(new_amount)
     })
 
 
-def execute_coin_event(
+def record_coin_event(
     kiosk_id,
     card_id,
     accepted,
@@ -654,13 +1159,22 @@ def execute_coin_event(
     amount_cents,
     reason
 ):
+
     now = utc_now()
 
     if DB_TYPE == "sqlite":
+
         execute("""
             INSERT INTO coin_events
-            (kiosk_id, card_id, accepted, coins,
-             amount_cents, reason, created_at)
+            (
+                kiosk_id,
+                card_id,
+                accepted,
+                coins,
+                amount_cents,
+                reason,
+                created_at
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             kiosk_id,
@@ -671,11 +1185,20 @@ def execute_coin_event(
             reason,
             now
         ))
+
     else:
+
         execute("""
             INSERT INTO coin_events
-            (kiosk_id, card_id, accepted, coins,
-             amount_cents, reason, created_at)
+            (
+                kiosk_id,
+                card_id,
+                accepted,
+                coins,
+                amount_cents,
+                reason,
+                created_at
+            )
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             kiosk_id,
@@ -688,102 +1211,165 @@ def execute_coin_event(
         ))
 
 
-# ------------------------------------------------------------
-# CONFIRM CHARGE
-# ------------------------------------------------------------
+# ============================================================
+# FINISH CHARGE
+# ============================================================
 
-@app.route("/api/kiosk/confirm-charge", methods=["POST"])
+@app.route(
+    "/api/kiosk/confirm-charge",
+    methods=["POST"]
+)
 def confirm_charge():
-    data = request.get_json(silent=True) or {}
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     scanned_card = str(
-        data.get("card_id", "")
+        data.get(
+            "card_id",
+            ""
+        )
     ).strip()
 
     if not scanned_card:
+
         return jsonify({
             "success": False,
-            "error": "CARD_REQUIRED"
+            "error":
+                "CARD_REQUIRED"
         }), 400
 
     active = get_active_session()
 
     if not active:
+
         return jsonify({
             "success": False,
-            "error": "NO_ACTIVE_CARD_SESSION"
+            "error":
+                "NO_ACTIVE_CARD_SESSION"
         }), 409
 
-    amount = active["amount_cents"]
+    amount = active[
+        "amount_cents"
+    ]
 
     if amount <= 0:
+
         return jsonify({
             "success": False,
-            "error": "NO_MONEY",
-            "message": "No coins have been inserted."
+            "error":
+                "NO_MONEY"
         }), 400
 
-    original_card = active["card_id"]
+    original_card = active[
+        "card_id"
+    ]
 
-    # DIFFERENT CARD
     if scanned_card != original_card:
-        ensure_card(scanned_card)
+
+        ensure_card(
+            scanned_card
+        )
+
+        create_machine_log(
+            "DIFFERENT_CARD",
+            "Different card detected during charge confirmation",
+            scanned_card,
+            amount
+        )
 
         return jsonify({
             "success": False,
             "different_card": True,
-            "original_card": original_card,
-            "scanned_card": scanned_card,
-            "amount_cents": amount,
-            "amount": money(amount)
+            "original_card":
+                original_card,
+            "scanned_card":
+                scanned_card,
+            "amount_cents":
+                amount,
+            "amount":
+                money(amount)
         }), 409
 
-    # SAME CARD
     return finalize_charge(
         active,
         scanned_card
     )
 
 
-def finalize_charge(active, card_id):
-    amount = active["amount_cents"]
-    coins = active["coin_count"]
+def finalize_charge(
+    active,
+    card_id
+):
+
+    amount = active[
+        "amount_cents"
+    ]
+
+    coins = active[
+        "coin_count"
+    ]
+
     now = utc_now()
 
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
 
             if DB_TYPE == "sqlite":
-                cur.execute(
-                    "SELECT balance_cents FROM cards WHERE card_id = ?",
-                    (card_id,)
-                )
+
+                cur.execute("""
+                    SELECT balance_cents
+                    FROM cards
+                    WHERE card_id = ?
+                """, (
+                    card_id,
+                ))
+
             else:
-                cur.execute(
-                    "SELECT balance_cents FROM cards WHERE card_id = %s FOR UPDATE",
-                    (card_id,)
-                )
 
-            card_row = cur.fetchone()
+                cur.execute("""
+                    SELECT balance_cents
+                    FROM cards
+                    WHERE card_id = %s
+                    FOR UPDATE
+                """, (
+                    card_id,
+                ))
 
-            if not card_row:
+            row = cur.fetchone()
+
+            if not row:
+
                 conn.rollback()
 
                 return jsonify({
                     "success": False,
-                    "error": "CARD_NOT_FOUND"
+                    "error":
+                        "CARD_NOT_FOUND"
                 }), 404
 
-            balance = card_row[0]
-            new_balance = balance + amount
+            balance = row[0]
+
+            new_balance = (
+                balance +
+                amount
+            )
 
             if DB_TYPE == "sqlite":
+
                 cur.execute("""
                     UPDATE cards
-                    SET balance_cents = ?,
+                    SET
+                        balance_cents = ?,
                         updated_at = ?
                     WHERE card_id = ?
                 """, (
@@ -794,8 +1380,15 @@ def finalize_charge(active, card_id):
 
                 cur.execute("""
                     INSERT INTO transactions
-                    (kiosk_id, card_id, type,
-                     amount_cents, coins, description, created_at)
+                    (
+                        kiosk_id,
+                        card_id,
+                        type,
+                        amount_cents,
+                        coins,
+                        description,
+                        created_at
+                    )
                     VALUES (?, ?, 'CHARGE', ?, ?, ?, ?)
                 """, (
                     KIOSK_ID,
@@ -808,7 +1401,8 @@ def finalize_charge(active, card_id):
 
                 cur.execute("""
                     UPDATE sessions
-                    SET status = 'completed',
+                    SET
+                        status = 'completed',
                         updated_at = ?
                     WHERE id = ?
                 """, (
@@ -817,9 +1411,11 @@ def finalize_charge(active, card_id):
                 ))
 
             else:
+
                 cur.execute("""
                     UPDATE cards
-                    SET balance_cents = %s,
+                    SET
+                        balance_cents = %s,
                         updated_at = %s
                     WHERE card_id = %s
                 """, (
@@ -830,8 +1426,15 @@ def finalize_charge(active, card_id):
 
                 cur.execute("""
                     INSERT INTO transactions
-                    (kiosk_id, card_id, type,
-                     amount_cents, coins, description, created_at)
+                    (
+                        kiosk_id,
+                        card_id,
+                        type,
+                        amount_cents,
+                        coins,
+                        description,
+                        created_at
+                    )
                     VALUES (%s, %s, 'CHARGE', %s, %s, %s, %s)
                 """, (
                     KIOSK_ID,
@@ -844,7 +1447,8 @@ def finalize_charge(active, card_id):
 
                 cur.execute("""
                     UPDATE sessions
-                    SET status = 'completed',
+                    SET
+                        status = 'completed',
                         updated_at = %s
                     WHERE id = %s
                 """, (
@@ -855,52 +1459,87 @@ def finalize_charge(active, card_id):
             conn.commit()
 
         except Exception:
+
             conn.rollback()
             raise
 
         finally:
+
             close_db(conn)
+
+    receipt = create_receipt(
+        card_id,
+        "CHARGE",
+        "Card charge",
+        amount,
+        new_balance
+    )
+
+    create_machine_log(
+        "CHARGE",
+        "Card charged successfully",
+        card_id,
+        amount
+    )
 
     return jsonify({
         "success": True,
-        "card_id": card_id,
-        "amount_cents": amount,
-        "amount": money(amount),
-        "balance_cents": new_balance,
-        "balance": money(new_balance)
+        "card_id":
+            card_id,
+        "amount_cents":
+            amount,
+        "amount":
+            money(amount),
+        "balance_cents":
+            new_balance,
+        "balance":
+            money(new_balance),
+        "receipt":
+            receipt
     })
 
 
-@app.route("/api/kiosk/confirm-different-card", methods=["POST"])
+@app.route(
+    "/api/kiosk/confirm-different-card",
+    methods=["POST"]
+)
 def confirm_different_card():
-    data = request.get_json(silent=True) or {}
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     scanned_card = str(
-        data.get("card_id", "")
+        data.get(
+            "card_id",
+            ""
+        )
     ).strip()
 
     if not scanned_card:
+
         return jsonify({
             "success": False,
-            "error": "CARD_REQUIRED"
+            "error":
+                "CARD_REQUIRED"
         }), 400
 
     active = get_active_session()
 
     if not active:
+
         return jsonify({
             "success": False,
-            "error": "NO_ACTIVE_CARD_SESSION"
+            "error":
+                "NO_ACTIVE_CARD_SESSION"
         }), 409
 
-    # The new card must be different from the original.
-    if scanned_card == active["card_id"]:
-        return finalize_charge(
-            active,
-            scanned_card
-        )
-
-    ensure_card(scanned_card)
+    ensure_card(
+        scanned_card
+    )
 
     return finalize_charge(
         active,
@@ -908,26 +1547,19 @@ def confirm_different_card():
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # STORE
-# ------------------------------------------------------------
+# ============================================================
 
 @app.route("/api/store/products")
 def store_products():
-    if DB_TYPE == "sqlite":
-        products = query_all("""
-            SELECT *
-            FROM products
-            WHERE active = 1
-            ORDER BY id ASC
-        """)
-    else:
-        products = query_all("""
-            SELECT *
-            FROM products
-            WHERE active = 1
-            ORDER BY id ASC
-        """)
+
+    products = query_all("""
+        SELECT *
+        FROM products
+        WHERE active = 1
+        ORDER BY id ASC
+    """)
 
     return jsonify({
         "success": True,
@@ -935,108 +1567,160 @@ def store_products():
             {
                 "id": p["id"],
                 "name": p["name"],
-                "price_cents": p["price_cents"],
-                "price": money(p["price_cents"])
+                "price_cents":
+                    p["price_cents"],
+                "price":
+                    money(
+                        p["price_cents"]
+                    )
             }
             for p in products
         ]
     })
 
 
-@app.route("/api/store/buy", methods=["POST"])
+@app.route(
+    "/api/store/buy",
+    methods=["POST"]
+)
 def store_buy():
-    data = request.get_json(silent=True) or {}
 
-    card_id = str(data.get("card_id", "")).strip()
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    card_id = str(
+        data.get(
+            "card_id",
+            ""
+        )
+    ).strip()
 
     try:
-        product_id = int(data.get("product_id"))
+
+        product_id = int(
+            data.get(
+                "product_id"
+            )
+        )
+
     except Exception:
+
         return jsonify({
             "success": False,
-            "error": "INVALID_PRODUCT"
+            "error":
+                "INVALID_PRODUCT"
         }), 400
 
-    if not card_id:
-        return jsonify({
-            "success": False,
-            "error": "CARD_REQUIRED"
-        }), 400
-
-    if DB_TYPE == "sqlite":
-        product = query_one("""
-            SELECT *
-            FROM products
-            WHERE id = ?
-            AND active = 1
-        """, (product_id,))
-    else:
-        product = query_one("""
-            SELECT *
-            FROM products
-            WHERE id = %s
-            AND active = 1
-        """, (product_id,))
+    product = query_one(
+        """
+        SELECT *
+        FROM products
+        WHERE id = ?
+        AND active = 1
+        """
+        if DB_TYPE == "sqlite"
+        else
+        """
+        SELECT *
+        FROM products
+        WHERE id = %s
+        AND active = 1
+        """,
+        (
+            product_id,
+        )
+    )
 
     if not product:
+
         return jsonify({
             "success": False,
-            "error": "PRODUCT_NOT_FOUND"
+            "error":
+                "PRODUCT_NOT_FOUND"
         }), 404
 
     now = utc_now()
 
     with db_lock:
+
         conn = get_db()
 
         try:
+
             cur = conn.cursor()
 
             if DB_TYPE == "sqlite":
+
                 cur.execute("""
                     SELECT balance_cents
                     FROM cards
                     WHERE card_id = ?
-                """, (card_id,))
+                """, (
+                    card_id,
+                ))
+
             else:
+
                 cur.execute("""
                     SELECT balance_cents
                     FROM cards
                     WHERE card_id = %s
                     FOR UPDATE
-                """, (card_id,))
+                """, (
+                    card_id,
+                ))
 
-            card = cur.fetchone()
+            row = cur.fetchone()
 
-            if not card:
+            if not row:
+
                 conn.rollback()
 
                 return jsonify({
                     "success": False,
-                    "error": "CARD_NOT_FOUND"
+                    "error":
+                        "CARD_NOT_FOUND"
                 }), 404
 
-            balance = card[0]
-            price = product["price_cents"]
+            balance = row[0]
+
+            price = product[
+                "price_cents"
+            ]
 
             if balance < price:
+
                 conn.rollback()
 
                 return jsonify({
                     "success": False,
-                    "error": "INSUFFICIENT_BALANCE",
-                    "balance_cents": balance,
-                    "balance": money(balance),
-                    "price_cents": price,
-                    "price": money(price)
+                    "error":
+                        "INSUFFICIENT_BALANCE",
+                    "balance_cents":
+                        balance,
+                    "balance":
+                        money(balance),
+                    "price_cents":
+                        price,
+                    "price":
+                        money(price)
                 }), 409
 
-            new_balance = balance - price
+            new_balance = (
+                balance -
+                price
+            )
 
             if DB_TYPE == "sqlite":
+
                 cur.execute("""
                     UPDATE cards
-                    SET balance_cents = ?,
+                    SET
+                        balance_cents = ?,
                         updated_at = ?
                     WHERE card_id = ?
                 """, (
@@ -1047,8 +1731,15 @@ def store_buy():
 
                 cur.execute("""
                     INSERT INTO transactions
-                    (kiosk_id, card_id, type,
-                     amount_cents, coins, description, created_at)
+                    (
+                        kiosk_id,
+                        card_id,
+                        type,
+                        amount_cents,
+                        coins,
+                        description,
+                        created_at
+                    )
                     VALUES (?, ?, 'PURCHASE', ?, 0, ?, ?)
                 """, (
                     KIOSK_ID,
@@ -1059,9 +1750,11 @@ def store_buy():
                 ))
 
             else:
+
                 cur.execute("""
                     UPDATE cards
-                    SET balance_cents = %s,
+                    SET
+                        balance_cents = %s,
                         updated_at = %s
                     WHERE card_id = %s
                 """, (
@@ -1072,8 +1765,15 @@ def store_buy():
 
                 cur.execute("""
                     INSERT INTO transactions
-                    (kiosk_id, card_id, type,
-                     amount_cents, coins, description, created_at)
+                    (
+                        kiosk_id,
+                        card_id,
+                        type,
+                        amount_cents,
+                        coins,
+                        description,
+                        created_at
+                    )
                     VALUES (%s, %s, 'PURCHASE', %s, 0, %s, %s)
                 """, (
                     KIOSK_ID,
@@ -1086,43 +1786,89 @@ def store_buy():
             conn.commit()
 
         except Exception:
+
             conn.rollback()
             raise
 
         finally:
+
             close_db(conn)
+
+    receipt = create_receipt(
+        card_id,
+        "PURCHASE",
+        product["name"],
+        -price,
+        new_balance
+    )
+
+    create_machine_log(
+        "PURCHASE",
+        "Product purchased: "
+        + product["name"],
+        card_id,
+        -price
+    )
 
     return jsonify({
         "success": True,
-        "product": product["name"],
-        "price_cents": price,
-        "price": money(price),
-        "balance_cents": new_balance,
-        "balance": money(new_balance)
+        "product":
+            product["name"],
+        "price_cents":
+            price,
+        "price":
+            money(price),
+        "balance_cents":
+            new_balance,
+        "balance":
+            money(new_balance),
+        "receipt":
+            receipt
     })
 
 
-# ------------------------------------------------------------
-# ADMIN LOGIN
-# ------------------------------------------------------------
+# ============================================================
+# ADMIN
+# ============================================================
 
-@app.route("/admin/login", methods=["GET", "POST"])
+@app.route(
+    "/admin/login",
+    methods=["GET", "POST"]
+)
 def admin_login():
 
     if request.method == "POST":
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
+
+        username = request.form.get(
+            "username",
+            ""
+        )
+
+        password = request.form.get(
+            "password",
+            ""
+        )
 
         if (
-            username == ADMIN_USERNAME
-            and password == ADMIN_PASSWORD
+            username ==
+            ADMIN_USERNAME
+            and
+            password ==
+            ADMIN_PASSWORD
         ):
-            session["admin"] = True
-            return redirect(url_for("admin"))
+
+            session[
+                "admin"
+            ] = True
+
+            return redirect(
+                url_for("admin")
+            )
 
         return render_template_string(
             ADMIN_LOGIN_HTML,
-            error="Incorrect username or password."
+            error=
+                "Incorrect username or password."
         )
 
     return render_template_string(
@@ -1133,14 +1879,26 @@ def admin_login():
 
 @app.route("/admin/logout")
 def admin_logout():
+
     session.clear()
-    return redirect(url_for("admin_login"))
+
+    return redirect(
+        url_for("admin_login")
+    )
 
 
 @app.route("/admin")
 def admin():
-    if not session.get("admin"):
-        return redirect(url_for("admin_login"))
+
+    if not session.get(
+        "admin"
+    ):
+
+        return redirect(
+            url_for(
+                "admin_login"
+            )
+        )
 
     return render_template_string(
         ADMIN_HTML,
@@ -1148,16 +1906,20 @@ def admin():
     )
 
 
-# ------------------------------------------------------------
-# ADMIN API
-# ------------------------------------------------------------
-
 def require_admin():
-    if not session.get("admin"):
-        return jsonify({
-            "success": False,
-            "error": "UNAUTHORIZED"
-        }), 401
+
+    if not session.get(
+        "admin"
+    ):
+
+        return (
+            jsonify({
+                "success": False,
+                "error":
+                    "UNAUTHORIZED"
+            }),
+            401
+        )
 
     return None
 
@@ -1176,21 +1938,21 @@ def admin_live():
         SELECT *
         FROM transactions
         ORDER BY id DESC
-        LIMIT 100
+        LIMIT 200
     """)
 
     coin_events = query_all("""
         SELECT *
         FROM coin_events
         ORDER BY id DESC
-        LIMIT 100
+        LIMIT 200
     """)
 
     cards = query_all("""
         SELECT *
         FROM cards
         ORDER BY updated_at DESC
-        LIMIT 100
+        LIMIT 200
     """)
 
     products = query_all("""
@@ -1199,17 +1961,28 @@ def admin_live():
         ORDER BY id ASC
     """)
 
+    receipts = query_all("""
+        SELECT *
+        FROM receipts
+        ORDER BY id DESC
+        LIMIT 100
+    """)
+
     return jsonify({
         "success": True,
         "active_session": active,
         "transactions": transactions,
         "coin_events": coin_events,
         "cards": cards,
-        "products": products
+        "products": products,
+        "receipts": receipts
     })
 
 
-@app.route("/api/admin/product", methods=["POST"])
+@app.route(
+    "/api/admin/product",
+    methods=["POST"]
+)
 def admin_product_create():
 
     auth = require_admin()
@@ -1217,36 +1990,57 @@ def admin_product_create():
     if auth:
         return auth
 
-    data = request.get_json(silent=True) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    name = str(data.get("name", "")).strip()
+    name = str(
+        data.get(
+            "name",
+            ""
+        )
+    ).strip()
 
     try:
-        price_cents = int(data.get("price_cents"))
+
+        price_cents = int(
+            data.get(
+                "price_cents"
+            )
+        )
+
     except Exception:
+
         return jsonify({
             "success": False,
-            "error": "INVALID_PRICE"
+            "error":
+                "INVALID_PRICE"
         }), 400
 
     if not name:
-        return jsonify({
-            "success": False,
-            "error": "NAME_REQUIRED"
-        }), 400
 
-    if price_cents < 0:
         return jsonify({
             "success": False,
-            "error": "INVALID_PRICE"
+            "error":
+                "NAME_REQUIRED"
         }), 400
 
     now = utc_now()
 
     if DB_TYPE == "sqlite":
+
         product_id = execute("""
             INSERT INTO products
-            (name, price_cents, active, created_at, updated_at)
+            (
+                name,
+                price_cents,
+                active,
+                created_at,
+                updated_at
+            )
             VALUES (?, ?, 1, ?, ?)
         """, (
             name,
@@ -1254,10 +2048,18 @@ def admin_product_create():
             now,
             now
         ))
+
     else:
-        row = query_one("""
+
+        product_id = execute("""
             INSERT INTO products
-            (name, price_cents, active, created_at, updated_at)
+            (
+                name,
+                price_cents,
+                active,
+                created_at,
+                updated_at
+            )
             VALUES (%s, %s, 1, %s, %s)
             RETURNING id
         """, (
@@ -1267,48 +2069,72 @@ def admin_product_create():
             now
         ))
 
-        product_id = row["id"]
-
     return jsonify({
         "success": True,
         "id": product_id
     })
 
 
-@app.route("/api/admin/product/<int:product_id>", methods=["POST"])
-def admin_product_update(product_id):
+@app.route(
+    "/api/admin/product/<int:product_id>",
+    methods=["POST"]
+)
+def admin_product_update(
+    product_id
+):
 
     auth = require_admin()
 
     if auth:
         return auth
 
-    data = request.get_json(silent=True) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    name = str(data.get("name", "")).strip()
+    name = str(
+        data.get(
+            "name",
+            ""
+        )
+    ).strip()
 
     try:
-        price_cents = int(data.get("price_cents"))
+
+        price_cents = int(
+            data.get(
+                "price_cents"
+            )
+        )
+
     except Exception:
+
         return jsonify({
             "success": False,
-            "error": "INVALID_PRICE"
+            "error":
+                "INVALID_PRICE"
         }), 400
 
-    active = 1 if data.get("active", True) else 0
-
-    if not name:
-        return jsonify({
-            "success": False,
-            "error": "NAME_REQUIRED"
-        }), 400
+    active = (
+        1
+        if data.get(
+            "active",
+            True
+        )
+        else 0
+    )
 
     now = utc_now()
 
     if DB_TYPE == "sqlite":
+
         execute("""
             UPDATE products
-            SET name = ?,
+            SET
+                name = ?,
                 price_cents = ?,
                 active = ?,
                 updated_at = ?
@@ -1320,10 +2146,13 @@ def admin_product_update(product_id):
             now,
             product_id
         ))
+
     else:
+
         execute("""
             UPDATE products
-            SET name = %s,
+            SET
+                name = %s,
                 price_cents = %s,
                 active = %s,
                 updated_at = %s
@@ -1341,8 +2170,13 @@ def admin_product_update(product_id):
     })
 
 
-@app.route("/api/admin/product/<int:product_id>/delete", methods=["POST"])
-def admin_product_delete(product_id):
+@app.route(
+    "/api/admin/product/<int:product_id>/delete",
+    methods=["POST"]
+)
+def admin_product_delete(
+    product_id
+):
 
     auth = require_admin()
 
@@ -1351,22 +2185,25 @@ def admin_product_delete(product_id):
 
     now = utc_now()
 
-    # Do not actually delete products because old
-    # transaction history should remain valid.
     if DB_TYPE == "sqlite":
+
         execute("""
             UPDATE products
-            SET active = 0,
+            SET
+                active = 0,
                 updated_at = ?
             WHERE id = ?
         """, (
             now,
             product_id
         ))
+
     else:
+
         execute("""
             UPDATE products
-            SET active = 0,
+            SET
+                active = 0,
                 updated_at = %s
             WHERE id = %s
         """, (
@@ -1379,22 +2216,74 @@ def admin_product_delete(product_id):
     })
 
 
-# ------------------------------------------------------------
+# ============================================================
+# BACKEND CONSOLE
+# ============================================================
+
+@app.route("/back")
+def backend_console():
+
+    return render_template_string(
+        BACK_HTML,
+        kiosk_id=KIOSK_ID
+    )
+
+
+@app.route("/api/back/live")
+def backend_live():
+
+    active = get_active_session()
+
+    transactions = query_all("""
+        SELECT *
+        FROM transactions
+        ORDER BY id DESC
+        LIMIT 100
+    """)
+
+    coin_events = query_all("""
+        SELECT *
+        FROM coin_events
+        ORDER BY id DESC
+        LIMIT 100
+    """)
+
+    receipts = query_all("""
+        SELECT *
+        FROM receipts
+        ORDER BY id DESC
+        LIMIT 50
+    """)
+
+    return jsonify({
+        "success": True,
+        "active_session": active,
+        "transactions": transactions,
+        "coin_events": coin_events,
+        "receipts": receipts
+    })
+
+
+# ============================================================
 # KIOSK HTML
-# ------------------------------------------------------------
+# ============================================================
 
 KIOSK_HTML = r"""
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport"
-      content="width=device-width,
-               initial-scale=1.0,
-               maximum-scale=1.0,
-               user-scalable=no">
 
-<title>Kiosk</title>
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,
+             initial-scale=1.0,
+             maximum-scale=1.0,
+             user-scalable=no">
+
+<title>Self Service</title>
 
 <style>
 
@@ -1430,12 +2319,12 @@ body {
     background:
         radial-gradient(
             circle at 20% 20%,
-            rgba(55, 110, 180, 0.20),
+            rgba(55,110,180,.20),
             transparent 40%
         ),
         radial-gradient(
             circle at 80% 70%,
-            rgba(0, 170, 255, 0.13),
+            rgba(0,170,255,.13),
             transparent 40%
         ),
         linear-gradient(
@@ -1452,7 +2341,7 @@ body {
     width: 100%;
     height: 100%;
     object-fit: cover;
-    opacity: 0.10;
+    opacity: .10;
     pointer-events: none;
 }
 
@@ -1462,8 +2351,8 @@ body {
     background:
         linear-gradient(
             135deg,
-            rgba(4, 11, 20, 0.91),
-            rgba(7, 20, 35, 0.87)
+            rgba(4,11,20,.91),
+            rgba(7,20,35,.87)
         );
 }
 
@@ -1478,13 +2367,14 @@ body {
 
 .screen.active {
     display: flex;
-    animation: screenIn 0.25s ease;
+    animation: screenIn .25s ease;
 }
 
 @keyframes screenIn {
+
     from {
         opacity: 0;
-        transform: scale(0.985);
+        transform: scale(.985);
     }
 
     to {
@@ -1523,23 +2413,24 @@ body {
 }
 
 .title {
-    font-size: clamp(36px, 5vw, 70px);
+    font-size: clamp(36px,5vw,70px);
     font-weight: 800;
     margin-bottom: 15px;
     text-align: center;
 }
 
 .subtitle {
-    font-size: clamp(18px, 2.2vw, 28px);
+    font-size: clamp(18px,2.2vw,28px);
     color: rgba(255,255,255,.68);
     text-align: center;
     margin-bottom: 45px;
 }
 
 .menu {
-    width: min(850px, 100%);
+    width: min(850px,100%);
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns:
+        repeat(3,1fr);
     gap: 20px;
 }
 
@@ -1557,10 +2448,6 @@ body {
     font-size: 25px;
     font-weight: 700;
     cursor: pointer;
-    transition:
-        transform .15s ease,
-        background .15s ease,
-        border .15s ease;
 }
 
 .big-button:active {
@@ -1568,13 +2455,8 @@ body {
 }
 
 .big-button:hover {
-    border-color: rgba(255,255,255,.30);
-    background:
-        linear-gradient(
-            145deg,
-            rgba(255,255,255,.17),
-            rgba(255,255,255,.06)
-        );
+    border-color:
+        rgba(255,255,255,.30);
 }
 
 .back-button {
@@ -1590,7 +2472,7 @@ body {
 }
 
 .card-area {
-    width: min(760px, 100%);
+    width: min(760px,100%);
     min-height: 230px;
     border-radius: 30px;
     border: 2px solid rgba(100,190,255,.30);
@@ -1614,6 +2496,7 @@ body {
 }
 
 @keyframes scanner {
+
     0%,100% {
         top: 20%;
         opacity: .25;
@@ -1644,9 +2527,10 @@ body {
 }
 
 .charge-box {
-    width: min(900px, 100%);
+    width: min(900px,100%);
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns:
+        1fr 1fr;
     gap: 20px;
     margin-bottom: 30px;
 }
@@ -1670,7 +2554,7 @@ body {
 }
 
 .amount {
-    font-size: clamp(55px, 8vw, 100px);
+    font-size: clamp(55px,8vw,100px);
     font-weight: 900;
     margin: 20px 0;
 }
@@ -1687,7 +2571,7 @@ body {
     min-height: 82px;
     border-radius: 20px;
     border: 0;
-    background: #ffffff;
+    background: white;
     color: #07111f;
     font-size: 23px;
     font-weight: 800;
@@ -1701,10 +2585,10 @@ body {
 }
 
 .warning {
-    width: min(850px, 100%);
+    width: min(850px,100%);
     padding: 35px;
     border-radius: 25px;
-    background: rgba(160, 100, 20, .16);
+    background: rgba(160,100,20,.16);
     border: 1px solid rgba(255,180,70,.35);
     text-align: center;
     margin-bottom: 30px;
@@ -1723,15 +2607,16 @@ body {
 }
 
 .balance {
-    font-size: clamp(65px, 10vw, 120px);
+    font-size: clamp(65px,10vw,120px);
     font-weight: 900;
     margin: 30px 0;
 }
 
 .products {
-    width: min(1000px, 100%);
+    width: min(1000px,100%);
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns:
+        repeat(3,1fr);
     gap: 20px;
     max-height: 60vh;
     overflow-y: auto;
@@ -1760,6 +2645,35 @@ body {
     font-weight: 900;
 }
 
+.receipt-box {
+    width: min(650px,100%);
+    padding: 30px;
+    border-radius: 25px;
+    background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.14);
+}
+
+.receipt-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 25px;
+    padding: 17px 0;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    font-size: 20px;
+}
+
+.receipt-line:last-child {
+    border-bottom: 0;
+}
+
+.receipt-line span {
+    color: rgba(255,255,255,.55);
+}
+
+.receipt-line strong {
+    text-align: right;
+}
+
 .success-title {
     font-size: 70px;
     font-weight: 900;
@@ -1767,6 +2681,7 @@ body {
 }
 
 @keyframes pulse {
+
     from {
         transform: scale(1);
     }
@@ -1789,7 +2704,7 @@ body {
     font-size: 15px;
 }
 
-@media (max-width: 850px) {
+@media (max-width:850px) {
 
     .screen {
         padding: 25px;
@@ -1819,21 +2734,28 @@ body {
 
 <div id="app">
 
-<video id="backgroundVideo"
-       autoplay
-       muted
-       loop
-       playsinline>
+<video
+    id="backgroundVideo"
+    autoplay
+    muted
+    loop
+    playsinline>
 </video>
 
 <div class="overlay"></div>
 
-<!-- MAIN -->
 
-<section id="homeScreen" class="screen active">
+<!-- HOME -->
+
+<section
+    id="homeScreen"
+    class="screen active">
 
     <div class="top">
-        <div class="brand">SELF SERVICE</div>
+
+        <div class="brand">
+            SELF SERVICE
+        </div>
 
         <button
             class="language"
@@ -1841,11 +2763,15 @@ body {
             id="languageButton">
             中文
         </button>
+
     </div>
 
     <div class="center">
 
-        <div class="title" data-en="Welcome" data-zh="欢迎">
+        <div
+            class="title"
+            data-en="Welcome"
+            data-zh="欢迎">
             Welcome
         </div>
 
@@ -1895,11 +2821,13 @@ body {
 
 <!-- SCAN -->
 
-<section id="scanScreen" class="screen">
+<section
+    id="scanScreen"
+    class="screen">
 
     <div class="top">
 
-        <div class="brand" id="scanBrand">
+        <div class="brand">
             SCAN CARD
         </div>
 
@@ -1907,17 +2835,19 @@ body {
 
     <div class="center">
 
-        <div class="title"
-             id="scanTitle"
-             data-en="Please scan your card"
-             data-zh="请刷卡">
+        <div
+            class="title"
+            id="scanTitle"
+            data-en="Please scan your card"
+            data-zh="请刷卡">
             Please scan your card
         </div>
 
-        <div class="subtitle"
-             id="scanSubtitle"
-             data-en="Hold your card against the reader"
-             data-zh="请将卡靠近读卡器">
+        <div
+            class="subtitle"
+            id="scanSubtitle"
+            data-en="Hold your card against the reader"
+            data-zh="请将卡靠近读卡器">
             Hold your card against the reader
         </div>
 
@@ -1940,9 +2870,23 @@ body {
         </div>
 
         <div class="timer">
-            <span data-en="Timeout in" data-zh="将在">Timeout in</span>
-            <span id="scanTimer">15</span>
-            <span data-en="seconds" data-zh="秒后超时">seconds</span>
+
+            <span
+                data-en="Timeout in"
+                data-zh="将在">
+                Timeout in
+            </span>
+
+            <span id="scanTimer">
+                15
+            </span>
+
+            <span
+                data-en="seconds"
+                data-zh="秒后超时">
+                seconds
+            </span>
+
         </div>
 
         <div class="button-row">
@@ -1964,7 +2908,9 @@ body {
 
 <!-- CHARGE -->
 
-<section id="chargeScreen" class="screen">
+<section
+    id="chargeScreen"
+    class="screen">
 
     <div class="top">
 
@@ -1976,13 +2922,16 @@ body {
 
     <div class="center">
 
-        <div class="subtitle"
-             data-en="Insert coins"
-             data-zh="投入硬币">
+        <div
+            class="subtitle"
+            data-en="Insert coins"
+            data-zh="投入硬币">
             Insert coins
         </div>
 
-        <div class="amount" id="chargeAmount">
+        <div
+            class="amount"
+            id="chargeAmount">
             $0.00
         </div>
 
@@ -2024,9 +2973,10 @@ body {
 
         </div>
 
-        <div class="subtitle"
-             data-en="When finished, scan the card again to update it."
-             data-zh="完成后，请再次刷卡更新卡片余额。">
+        <div
+            class="subtitle"
+            data-en="When finished, scan the card again to update it."
+            data-zh="完成后，请再次刷卡更新卡片余额。">
             When finished, scan the card again to update it.
         </div>
 
@@ -2058,15 +3008,23 @@ body {
         </div>
 
         <div class="timer">
-            <span data-en="Session timeout in"
-                  data-zh="会话将在">
+
+            <span
+                data-en="Session timeout in"
+                data-zh="会话将在">
                 Session timeout in
             </span>
-            <span id="chargeTimer">60</span>
-            <span data-en="seconds"
-                  data-zh="秒后超时">
+
+            <span id="chargeTimer">
+                60
+            </span>
+
+            <span
+                data-en="seconds"
+                data-zh="秒后超时">
                 seconds
             </span>
+
         </div>
 
     </div>
@@ -2076,10 +3034,16 @@ body {
 
 <!-- DIFFERENT CARD -->
 
-<section id="differentScreen" class="screen">
+<section
+    id="differentScreen"
+    class="screen">
 
     <div class="top">
-        <div class="brand">CARD CHANGE</div>
+
+        <div class="brand">
+            CARD CHANGE
+        </div>
+
     </div>
 
     <div class="center">
@@ -2096,34 +3060,46 @@ body {
             <div class="warning-text">
 
                 <div>
-                    <span data-en="Original card:"
-                          data-zh="原卡片：">
+                    <span
+                        data-en="Original card:"
+                        data-zh="原卡片：">
                         Original card:
                     </span>
 
-                    <strong id="originalCard">-</strong>
+                    <strong
+                        id="originalCard">
+                        -
+                    </strong>
                 </div>
 
                 <br>
 
                 <div>
-                    <span data-en="Scanned card:"
-                          data-zh="扫描卡片：">
+                    <span
+                        data-en="Scanned card:"
+                        data-zh="扫描卡片：">
                         Scanned card:
                     </span>
 
-                    <strong id="differentCard">-</strong>
+                    <strong
+                        id="differentCard">
+                        -
+                    </strong>
                 </div>
 
                 <br>
 
                 <div>
-                    <span data-en="Amount:"
-                          data-zh="金额：">
+                    <span
+                        data-en="Amount:"
+                        data-zh="金额：">
                         Amount:
                     </span>
 
-                    <strong id="differentAmount">$0.00</strong>
+                    <strong
+                        id="differentAmount">
+                        $0.00
+                    </strong>
                 </div>
 
                 <br>
@@ -2165,19 +3141,23 @@ body {
 
 <!-- DIFFERENT CONFIRM -->
 
-<section id="differentConfirmScreen" class="screen">
+<section
+    id="differentConfirmScreen"
+    class="screen">
 
     <div class="center">
 
-        <div class="title"
-             data-en="Scan the new card again"
-             data-zh="请再次刷新卡片">
+        <div
+            class="title"
+            data-en="Scan the new card again"
+            data-zh="请再次刷新卡片">
             Scan the new card again
         </div>
 
-        <div class="subtitle"
-             data-en="This confirms that the balance should be transferred to this card."
-             data-zh="再次刷卡以确认余额充值到此卡。">
+        <div
+            class="subtitle"
+            data-en="This confirms that the balance should be transferred to this card."
+            data-zh="再次刷卡以确认余额充值到此卡。">
             This confirms that the balance should be transferred to this card.
         </div>
 
@@ -2200,15 +3180,23 @@ body {
         </div>
 
         <div class="timer">
-            <span data-en="Timeout in"
-                  data-zh="将在">
+
+            <span
+                data-en="Timeout in"
+                data-zh="将在">
                 Timeout in
             </span>
-            <span id="differentTimer">15</span>
-            <span data-en="seconds"
-                  data-zh="秒后超时">
+
+            <span id="differentTimer">
+                15
+            </span>
+
+            <span
+                data-en="seconds"
+                data-zh="秒后超时">
                 seconds
             </span>
+
         </div>
 
         <button
@@ -2226,10 +3214,16 @@ body {
 
 <!-- BALANCE -->
 
-<section id="balanceScreen" class="screen">
+<section
+    id="balanceScreen"
+    class="screen">
 
     <div class="top">
-        <div class="brand">BALANCE</div>
+
+        <div class="brand">
+            BALANCE
+        </div>
+
     </div>
 
     <div class="center">
@@ -2254,17 +3248,23 @@ body {
         </div>
 
         <div class="timer">
-            <span data-en="Returning in"
-                  data-zh="将在">
+
+            <span
+                data-en="Returning in"
+                data-zh="将在">
                 Returning in
             </span>
 
-            <span id="balanceTimer">5</span>
+            <span id="balanceTimer">
+                5
+            </span>
 
-            <span data-en="seconds"
-                  data-zh="秒后返回">
+            <span
+                data-en="seconds"
+                data-zh="秒后返回">
                 seconds
             </span>
+
         </div>
 
     </div>
@@ -2274,7 +3274,9 @@ body {
 
 <!-- STORE -->
 
-<section id="storeScreen" class="screen">
+<section
+    id="storeScreen"
+    class="screen">
 
     <div class="top">
 
@@ -2328,9 +3330,103 @@ body {
 </section>
 
 
+<!-- RECEIPT -->
+
+<section
+    id="receiptScreen"
+    class="screen">
+
+    <div class="center">
+
+        <div
+            class="title"
+            data-en="Receipt"
+            data-zh="收据">
+            Receipt
+        </div>
+
+        <div class="receipt-box">
+
+            <div class="receipt-line">
+                <span>Receipt</span>
+                <strong
+                    id="receiptNumber">
+                    -
+                </strong>
+            </div>
+
+            <div class="receipt-line">
+                <span>Card</span>
+                <strong
+                    id="receiptCard">
+                    -
+                </strong>
+            </div>
+
+            <div class="receipt-line">
+                <span>Transaction</span>
+                <strong
+                    id="receiptDescription">
+                    -
+                </strong>
+            </div>
+
+            <div class="receipt-line">
+                <span>Amount</span>
+                <strong
+                    id="receiptAmount">
+                    $0.00
+                </strong>
+            </div>
+
+            <div class="receipt-line">
+                <span>Balance</span>
+                <strong
+                    id="receiptBalance">
+                    $0.00
+                </strong>
+            </div>
+
+            <div class="receipt-line">
+                <span>Time</span>
+                <strong
+                    id="receiptTime">
+                    -
+                </strong>
+            </div>
+
+        </div>
+
+        <div class="timer">
+
+            <span
+                data-en="Returning in"
+                data-zh="将在">
+                Returning in
+            </span>
+
+            <span id="receiptTimer">
+                5
+            </span>
+
+            <span
+                data-en="seconds"
+                data-zh="秒后返回">
+                seconds
+            </span>
+
+        </div>
+
+    </div>
+
+</section>
+
+
 <!-- SUCCESS -->
 
-<section id="successScreen" class="screen">
+<section
+    id="successScreen"
+    class="screen">
 
     <div class="center">
 
@@ -2353,7 +3449,9 @@ body {
 
 <!-- ERROR -->
 
-<section id="errorScreen" class="screen">
+<section
+    id="errorScreen"
+    class="screen">
 
     <div class="center">
 
@@ -2383,9 +3481,11 @@ body {
 
 </div>
 
+
 <script>
 
-const KIOSK_ID = "{{ KIOSK_ID }}";
+const KIOSK_ID =
+    "{{ KIOSK_ID }}";
 
 let language = "en";
 
@@ -2393,86 +3493,89 @@ let currentMode = null;
 let currentCard = null;
 
 let differentCard = null;
-let differentAmount = 0;
 
-let timerInterval = null;
-let stateInterval = null;
-
-let scanTimeout = null;
+let timeoutInterval = null;
+let chargePollingInterval = null;
+let successTimeout = null;
 
 
-// ------------------------------------------------------------
+// ============================================================
 // LANGUAGE
-// ------------------------------------------------------------
+// ============================================================
 
 function toggleLanguage() {
 
-    language = language === "en" ? "zh" : "en";
+    language =
+        language === "en"
+            ? "zh"
+            : "en";
 
-    document.querySelectorAll("[data-en]").forEach(el => {
+    document
+        .querySelectorAll(
+            "[data-en]"
+        )
+        .forEach(
+            element => {
 
-        el.textContent =
-            language === "en"
-                ? el.dataset.en
-                : el.dataset.zh;
+                element.textContent =
+                    language === "en"
+                        ? element.dataset.en
+                        : element.dataset.zh;
 
-    });
+            }
+        );
 
-    document.getElementById("languageButton").textContent =
+    document.getElementById(
+        "languageButton"
+    ).textContent =
         language === "en"
             ? "中文"
             : "English";
 }
 
 
-// ------------------------------------------------------------
-// SCREENS
-// ------------------------------------------------------------
+// ============================================================
+// TIMERS
+// ============================================================
 
-function showScreen(id) {
+function stopTimeout() {
 
-    document
-        .querySelectorAll(".screen")
-        .forEach(screen => {
-            screen.classList.remove("active");
-        });
+    if (timeoutInterval) {
 
-    document
-        .getElementById(id)
-        .classList.add("active");
+        clearInterval(
+            timeoutInterval
+        );
+
+        timeoutInterval = null;
+    }
 }
 
 
-function goHome() {
+function stopChargePolling() {
 
-    stopTimers();
+    if (chargePollingInterval) {
 
-    fetch("/api/kiosk/end", {
-        method: "POST"
-    }).catch(() => {});
+        clearInterval(
+            chargePollingInterval
+        );
 
-    currentMode = null;
-    currentCard = null;
-
-    showScreen("homeScreen");
+        chargePollingInterval = null;
+    }
 }
 
 
-function stopTimers() {
+function stopAllTimers() {
 
-    if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-    }
+    stopTimeout();
+    stopChargePolling();
 
-    if (stateInterval) {
-        clearInterval(stateInterval);
-        stateInterval = null;
-    }
+    if (successTimeout) {
 
-    if (scanTimeout) {
-        clearTimeout(scanTimeout);
-        scanTimeout = null;
+        clearTimeout(
+            successTimeout
+        );
+
+        successTimeout = null;
     }
 }
 
@@ -2483,36 +3586,97 @@ function startCountdown(
     callback
 ) {
 
-    stopTimers();
+    stopTimeout();
 
-    let remaining = seconds;
+    let remaining =
+        seconds;
 
     const element =
-        document.getElementById(elementId);
+        document.getElementById(
+            elementId
+        );
 
-    element.textContent = remaining;
+    element.textContent =
+        remaining;
 
-    timerInterval = setInterval(() => {
+    timeoutInterval =
+        setInterval(
+            () => {
 
-        remaining--;
+                remaining--;
 
-        element.textContent = remaining;
+                element.textContent =
+                    remaining;
 
-        if (remaining <= 0) {
+                if (
+                    remaining <= 0
+                ) {
 
-            clearInterval(timerInterval);
-            timerInterval = null;
+                    stopTimeout();
 
-            callback();
-        }
+                    callback();
+                }
 
-    }, 1000);
+            },
+            1000
+        );
 }
 
 
-// ------------------------------------------------------------
+// ============================================================
+// SCREEN
+// ============================================================
+
+function showScreen(id) {
+
+    document
+        .querySelectorAll(
+            ".screen"
+        )
+        .forEach(
+            screen => {
+
+                screen.classList.remove(
+                    "active"
+                );
+
+            }
+        );
+
+    document
+        .getElementById(id)
+        .classList.add(
+            "active"
+        );
+}
+
+
+function goHome() {
+
+    stopAllTimers();
+
+    fetch(
+        "/api/kiosk/end",
+        {
+            method: "POST"
+        }
+    ).catch(
+        () => {}
+    );
+
+    currentMode = null;
+    currentCard = null;
+    differentCard = null;
+
+    showScreen(
+        "homeScreen"
+    );
+}
+
+
+// ============================================================
 // SCANNER
-// ------------------------------------------------------------
+// ============================================================
 
 function focusInput(id) {
 
@@ -2525,50 +3689,68 @@ function focusInput(id) {
 
     input.value = "";
 
-    setTimeout(() => {
-        input.focus();
-    }, 100);
+    setTimeout(
+        () => {
+            input.focus();
+        },
+        100
+    );
 }
 
 
-function setupScanner(inputId, handler) {
+function setupScanner(
+    inputId,
+    handler
+) {
 
     const input =
-        document.getElementById(inputId);
+        document.getElementById(
+            inputId
+        );
 
-    input.addEventListener("keydown", event => {
-
-        if (event.key === "Enter") {
-
-            event.preventDefault();
-
-            const value =
-                input.value.trim();
-
-            input.value = "";
-
-            if (value) {
-                handler(value);
-            }
-        }
-    });
-
-    input.addEventListener("blur", () => {
-
-        setTimeout(() => {
-
-            const active =
-                document.activeElement;
+    input.addEventListener(
+        "keydown",
+        event => {
 
             if (
-                !active ||
-                active === document.body
+                event.key ===
+                "Enter"
             ) {
-                input.focus();
-            }
 
-        }, 100);
-    });
+                event.preventDefault();
+
+                const value =
+                    input.value.trim();
+
+                input.value = "";
+
+                if (value) {
+                    handler(value);
+                }
+            }
+        }
+    );
+
+    input.addEventListener(
+        "blur",
+        () => {
+
+            setTimeout(
+                () => {
+
+                    if (
+                        document.activeElement
+                        === document.body
+                    ) {
+
+                        input.focus();
+                    }
+
+                },
+                100
+            );
+        }
+    );
 }
 
 
@@ -2588,23 +3770,31 @@ setupScanner(
 );
 
 
-// ------------------------------------------------------------
+// ============================================================
 // CHARGE
-// ------------------------------------------------------------
+// ============================================================
 
 function startCharge() {
 
-    currentMode = "charge";
+    currentMode =
+        "charge";
+
     currentCard = null;
 
-    showScreen("scanScreen");
+    showScreen(
+        "scanScreen"
+    );
 
-    document.getElementById("scanTitle").textContent =
+    document.getElementById(
+        "scanTitle"
+    ).textContent =
         language === "en"
             ? "Please scan your card"
             : "请刷卡";
 
-    document.getElementById("scanSubtitle").textContent =
+    document.getElementById(
+        "scanSubtitle"
+    ).textContent =
         language === "en"
             ? "Hold your card against the reader"
             : "请将卡靠近读卡器";
@@ -2615,86 +3805,115 @@ function startCharge() {
         () => goHome()
     );
 
-    focusInput("scanInput");
+    focusInput(
+        "scanInput"
+    );
 }
 
 
-async function handleInitialScan(cardId) {
+async function handleInitialScan(
+    cardId
+) {
 
-    if (currentMode === "charge") {
+    try {
 
-        try {
-
-            const response =
-                await fetch(
-                    "/api/kiosk/scan",
-                    {
-                        method: "POST",
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-                        body: JSON.stringify({
-                            card_id: cardId,
-                            mode: "charge"
+        const response =
+            await fetch(
+                "/api/kiosk/scan",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body:
+                        JSON.stringify({
+                            card_id:
+                                cardId,
+                            mode:
+                                currentMode
                         })
-                    }
-                );
+                }
+            );
 
-            const data =
-                await response.json();
+        const data =
+            await response.json();
 
-            if (!response.ok || !data.success) {
-                showError(
-                    data.error ||
-                    "Unable to start charge."
-                );
-                return;
-            }
+        if (
+            !response.ok ||
+            !data.success
+        ) {
 
-            currentCard = data.card_id;
+            showError(
+                data.error ||
+                "Unable to scan card."
+            );
+
+            return;
+        }
+
+        currentCard =
+            data.card_id;
+
+        if (
+            currentMode ===
+            "charge"
+        ) {
 
             showChargeScreen();
 
-        } catch (error) {
+        } else if (
+            currentMode ===
+            "balance"
+        ) {
 
-            showError(
-                "Unable to contact the server."
+            showBalance(
+                data
+            );
+
+        } else if (
+            currentMode ===
+            "store"
+        ) {
+
+            await loadStore(
+                data
             );
         }
 
-        return;
-    }
+    } catch (error) {
 
-    if (currentMode === "balance") {
-
-        await checkBalance(cardId);
-
-        return;
-    }
-
-    if (currentMode === "store") {
-
-        await loadStoreForCard(cardId);
-
-        return;
+        showError(
+            language === "en"
+                ? "Unable to contact the server."
+                : "无法连接服务器。"
+        );
     }
 }
 
 
 function showChargeScreen() {
 
-    stopTimers();
+    stopTimeout();
+    stopChargePolling();
 
-    showScreen("chargeScreen");
+    showScreen(
+        "chargeScreen"
+    );
 
-    document.getElementById("chargeCard").textContent =
+    document.getElementById(
+        "chargeCard"
+    ).textContent =
         currentCard;
 
-    document.getElementById("chargeAmount").textContent =
+    document.getElementById(
+        "chargeAmount"
+    ).textContent =
         "$0.00";
 
-    document.getElementById("chargeCoins").textContent =
+    document.getElementById(
+        "chargeCoins"
+    ).textContent =
         "0";
 
     startChargePolling();
@@ -2711,11 +3930,15 @@ function showChargeScreen() {
 
 function focusChargeScanner() {
 
-    focusInput("chargeScanInput");
+    focusInput(
+        "chargeScanInput"
+    );
 }
 
 
-async function handleChargeFinishScan(cardId) {
+async function handleChargeFinishScan(
+    cardId
+) {
 
     try {
 
@@ -2728,9 +3951,11 @@ async function handleChargeFinishScan(cardId) {
                         "Content-Type":
                             "application/json"
                     },
-                    body: JSON.stringify({
-                        card_id: cardId
-                    })
+                    body:
+                        JSON.stringify({
+                            card_id:
+                                cardId
+                        })
                 }
             );
 
@@ -2743,9 +3968,6 @@ async function handleChargeFinishScan(cardId) {
 
             differentCard =
                 data.scanned_card;
-
-            differentAmount =
-                data.amount_cents;
 
             document.getElementById(
                 "originalCard"
@@ -2762,7 +3984,7 @@ async function handleChargeFinishScan(cardId) {
             ).textContent =
                 data.amount;
 
-            stopTimers();
+            stopAllTimers();
 
             showScreen(
                 "differentScreen"
@@ -2771,20 +3993,10 @@ async function handleChargeFinishScan(cardId) {
             return;
         }
 
-        if (!response.ok || !data.success) {
-
-            if (
-                data.error === "NO_MONEY"
-            ) {
-
-                showError(
-                    language === "en"
-                        ? "No coins have been inserted."
-                        : "还没有投入硬币。"
-                );
-
-                return;
-            }
+        if (
+            !response.ok ||
+            !data.success
+        ) {
 
             showError(
                 data.error ||
@@ -2794,10 +4006,11 @@ async function handleChargeFinishScan(cardId) {
             return;
         }
 
-        showSuccess(
-            language === "en"
-                ? `${data.amount} added to your card.`
-                : `已充值 ${data.amount}。`
+        currentCard =
+            data.card_id;
+
+        showReceipt(
+            data.receipt
         );
 
     } catch (error) {
@@ -2813,67 +4026,79 @@ async function handleChargeFinishScan(cardId) {
 
 function startChargePolling() {
 
-    if (stateInterval) {
-        clearInterval(stateInterval);
-    }
+    stopChargePolling();
 
-    stateInterval = setInterval(
-        async () => {
+    async function updateCharge() {
 
-            try {
+        try {
 
-                const response =
-                    await fetch(
-                        "/api/kiosk/state"
-                    );
+            const response =
+                await fetch(
+                    "/api/kiosk/state?t="
+                    + Date.now(),
+                    {
+                        cache:
+                            "no-store"
+                    }
+                );
 
-                const data =
-                    await response.json();
+            const data =
+                await response.json();
 
-                if (
-                    data.active &&
-                    data.session
-                ) {
+            if (
+                data.active &&
+                data.session
+            ) {
 
-                    const session =
-                        data.session;
+                const s =
+                    data.session;
 
-                    document.getElementById(
-                        "chargeAmount"
-                    ).textContent =
-                        session.amount;
+                document.getElementById(
+                    "chargeAmount"
+                ).textContent =
+                    s.amount;
 
-                    document.getElementById(
-                        "chargeCoins"
-                    ).textContent =
-                        session.coin_count;
+                document.getElementById(
+                    "chargeCoins"
+                ).textContent =
+                    s.coin_count;
 
-                    document.getElementById(
-                        "chargeCard"
-                    ).textContent =
-                        session.card_id;
-                }
-
-            } catch (error) {
-                // Keep polling.
+                document.getElementById(
+                    "chargeCard"
+                ).textContent =
+                    s.card_id;
             }
 
-        },
-        500
-    );
+        } catch (error) {
+
+            console.log(
+                "Charge polling error",
+                error
+            );
+        }
+    }
+
+    updateCharge();
+
+    chargePollingInterval =
+        setInterval(
+            updateCharge,
+            250
+        );
 }
 
 
 async function cancelCharge() {
 
-    stopTimers();
+    stopAllTimers();
 
     try {
 
         await fetch(
             "/api/kiosk/end",
             {
-                method: "POST"
+                method:
+                    "POST"
             }
         );
 
@@ -2882,17 +4107,19 @@ async function cancelCharge() {
     currentMode = null;
     currentCard = null;
 
-    showScreen("homeScreen");
+    showScreen(
+        "homeScreen"
+    );
 }
 
 
-// ------------------------------------------------------------
+// ============================================================
 // DIFFERENT CARD
-// ------------------------------------------------------------
+// ============================================================
 
 function continueDifferentCard() {
 
-    stopTimers();
+    stopAllTimers();
 
     currentMode =
         "different-confirm";
@@ -2913,7 +4140,9 @@ function continueDifferentCard() {
 }
 
 
-async function handleDifferentConfirmScan(cardId) {
+async function handleDifferentConfirmScan(
+    cardId
+) {
 
     try {
 
@@ -2926,16 +4155,21 @@ async function handleDifferentConfirmScan(cardId) {
                         "Content-Type":
                             "application/json"
                     },
-                    body: JSON.stringify({
-                        card_id: cardId
-                    })
+                    body:
+                        JSON.stringify({
+                            card_id:
+                                cardId
+                        })
                 }
             );
 
         const data =
             await response.json();
 
-        if (!response.ok || !data.success) {
+        if (
+            !response.ok ||
+            !data.success
+        ) {
 
             showError(
                 data.error ||
@@ -2948,10 +4182,8 @@ async function handleDifferentConfirmScan(cardId) {
         currentCard =
             data.card_id;
 
-        showSuccess(
-            language === "en"
-                ? `${data.amount} added to the card.`
-                : `已充值 ${data.amount}。`
+        showReceipt(
+            data.receipt
         );
 
     } catch (error) {
@@ -2967,30 +4199,38 @@ async function handleDifferentConfirmScan(cardId) {
 
 function returnToCharge() {
 
-    stopTimers();
+    stopAllTimers();
 
-    currentMode = "charge";
+    currentMode =
+        "charge";
 
     showChargeScreen();
 }
 
 
-// ------------------------------------------------------------
+// ============================================================
 // BALANCE
-// ------------------------------------------------------------
+// ============================================================
 
 function startBalance() {
 
-    currentMode = "balance";
+    currentMode =
+        "balance";
 
-    showScreen("scanScreen");
+    showScreen(
+        "scanScreen"
+    );
 
-    document.getElementById("scanTitle").textContent =
+    document.getElementById(
+        "scanTitle"
+    ).textContent =
         language === "en"
             ? "Scan your card"
             : "请刷卡";
 
-    document.getElementById("scanSubtitle").textContent =
+    document.getElementById(
+        "scanSubtitle"
+    ).textContent =
         language === "en"
             ? "Checking your balance"
             : "正在查询余额";
@@ -3001,90 +4241,61 @@ function startBalance() {
         () => goHome()
     );
 
-    focusInput("scanInput");
+    focusInput(
+        "scanInput"
+    );
 }
 
 
-async function checkBalance(cardId) {
+function showBalance(data) {
 
-    try {
+    stopAllTimers();
 
-        const response =
-            await fetch(
-                "/api/kiosk/scan",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-                    body: JSON.stringify({
-                        card_id: cardId,
-                        mode: "balance"
-                    })
-                }
-            );
+    document.getElementById(
+        "balanceAmount"
+    ).textContent =
+        data.balance;
 
-        const data =
-            await response.json();
+    document.getElementById(
+        "balanceCard"
+    ).textContent =
+        data.card_id;
 
-        if (!response.ok || !data.success) {
+    showScreen(
+        "balanceScreen"
+    );
 
-            showError(
-                data.error ||
-                "Unable to read balance."
-            );
-
-            return;
-        }
-
-        document.getElementById(
-            "balanceAmount"
-        ).textContent =
-            data.balance;
-
-        document.getElementById(
-            "balanceCard"
-        ).textContent =
-            data.card_id;
-
-        showScreen(
-            "balanceScreen"
-        );
-
-        startCountdown(
-            "balanceTimer",
-            5,
-            () => goHome()
-        );
-
-    } catch (error) {
-
-        showError(
-            language === "en"
-                ? "Unable to contact the server."
-                : "无法连接服务器。"
-        );
-    }
+    startCountdown(
+        "balanceTimer",
+        5,
+        () => goHome()
+    );
 }
 
 
-// ------------------------------------------------------------
+// ============================================================
 // STORE
-// ------------------------------------------------------------
+// ============================================================
 
 function startStore() {
 
-    currentMode = "store";
+    currentMode =
+        "store";
 
-    showScreen("scanScreen");
+    showScreen(
+        "scanScreen"
+    );
 
-    document.getElementById("scanTitle").textContent =
+    document.getElementById(
+        "scanTitle"
+    ).textContent =
         language === "en"
             ? "Scan your card"
             : "请刷卡";
 
-    document.getElementById("scanSubtitle").textContent =
+    document.getElementById(
+        "scanSubtitle"
+    ).textContent =
         language === "en"
             ? "Your card is required to use the store"
             : "使用商店需要刷卡";
@@ -3095,61 +4306,23 @@ function startStore() {
         () => goHome()
     );
 
-    focusInput("scanInput");
+    focusInput(
+        "scanInput"
+    );
 }
 
 
-async function loadStoreForCard(cardId) {
+async function loadStore(data) {
 
     try {
 
-        const cardResponse =
-            await fetch(
-                "/api/kiosk/scan",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-                    body: JSON.stringify({
-                        card_id: cardId,
-                        mode: "store"
-                    })
-                }
-            );
-
-        const cardData =
-            await cardResponse.json();
-
-        if (
-            !cardResponse.ok ||
-            !cardData.success
-        ) {
-
-            showError(
-                cardData.error ||
-                "Unable to read card."
-            );
-
-            return;
-        }
-
-        currentCard =
-            cardData.card_id;
-
-        document.getElementById(
-            "storeBalance"
-        ).textContent =
-            cardData.balance;
-
-        const productsResponse =
+        const response =
             await fetch(
                 "/api/store/products"
             );
 
-        const productsData =
-            await productsResponse.json();
+        const products =
+            await response.json();
 
         const container =
             document.getElementById(
@@ -3158,7 +4331,12 @@ async function loadStoreForCard(cardId) {
 
         container.innerHTML = "";
 
-        productsData.products.forEach(
+        document.getElementById(
+            "storeBalance"
+        ).textContent =
+            data.balance;
+
+        products.products.forEach(
             product => {
 
                 const button =
@@ -3179,8 +4357,8 @@ async function loadStoreForCard(cardId) {
                     </div>
                 `;
 
-                button.onclick = () =>
-                    buyProduct(
+                button.onclick =
+                    () => buyProduct(
                         product.id
                     );
 
@@ -3190,7 +4368,7 @@ async function loadStoreForCard(cardId) {
             }
         );
 
-        stopTimers();
+        stopAllTimers();
 
         showScreen(
             "storeScreen"
@@ -3200,14 +4378,16 @@ async function loadStoreForCard(cardId) {
 
         showError(
             language === "en"
-                ? "Unable to contact the server."
-                : "无法连接服务器。"
+                ? "Unable to load products."
+                : "无法加载商品。"
         );
     }
 }
 
 
-async function buyProduct(productId) {
+async function buyProduct(
+    productId
+) {
 
     try {
 
@@ -3220,17 +4400,23 @@ async function buyProduct(productId) {
                         "Content-Type":
                             "application/json"
                     },
-                    body: JSON.stringify({
-                        card_id: currentCard,
-                        product_id: productId
-                    })
+                    body:
+                        JSON.stringify({
+                            card_id:
+                                currentCard,
+                            product_id:
+                                productId
+                        })
                 }
             );
 
         const data =
             await response.json();
 
-        if (!response.ok || !data.success) {
+        if (
+            !response.ok ||
+            !data.success
+        ) {
 
             if (
                 data.error ===
@@ -3254,15 +4440,8 @@ async function buyProduct(productId) {
             return;
         }
 
-        document.getElementById(
-            "storeBalance"
-        ).textContent =
-            data.balance;
-
-        showSuccess(
-            language === "en"
-                ? `${data.product} purchased.`
-                : `已购买 ${data.product}。`
+        showReceipt(
+            data.receipt
         );
 
     } catch (error) {
@@ -3276,36 +4455,74 @@ async function buyProduct(productId) {
 }
 
 
-// ------------------------------------------------------------
-// SUCCESS / ERROR
-// ------------------------------------------------------------
+// ============================================================
+// RECEIPT
+// ============================================================
 
-function showSuccess(text) {
+function showReceipt(
+    receipt
+) {
 
-    stopTimers();
+    stopAllTimers();
 
     document.getElementById(
-        "successText"
-    ).textContent = text;
+        "receiptNumber"
+    ).textContent =
+        receipt.receipt_number;
+
+    document.getElementById(
+        "receiptCard"
+    ).textContent =
+        receipt.card_id;
+
+    document.getElementById(
+        "receiptDescription"
+    ).textContent =
+        receipt.description;
+
+    document.getElementById(
+        "receiptAmount"
+    ).textContent =
+        money(
+            receipt.amount_cents
+        );
+
+    document.getElementById(
+        "receiptBalance"
+    ).textContent =
+        money(
+            receipt.balance_after_cents
+        );
+
+    document.getElementById(
+        "receiptTime"
+    ).textContent =
+        receipt.created_at;
 
     showScreen(
-        "successScreen"
+        "receiptScreen"
     );
 
-    setTimeout(
-        () => goHome(),
-        3000
+    startCountdown(
+        "receiptTimer",
+        5,
+        () => goHome()
     );
 }
 
 
+// ============================================================
+// SUCCESS / ERROR
+// ============================================================
+
 function showError(text) {
 
-    stopTimers();
+    stopAllTimers();
 
     document.getElementById(
         "errorText"
-    ).textContent = text;
+    ).textContent =
+        text;
 
     showScreen(
         "errorScreen"
@@ -3313,24 +4530,33 @@ function showError(text) {
 }
 
 
-// ------------------------------------------------------------
-// SECURITY
-// ------------------------------------------------------------
+function money(cents) {
+
+    return "$" +
+        (
+            Number(cents) /
+            100
+        ).toFixed(2);
+}
+
 
 function escapeHtml(value) {
 
     const div =
-        document.createElement("div");
+        document.createElement(
+            "div"
+        );
 
-    div.textContent = value;
+    div.textContent =
+        value;
 
     return div.innerHTML;
 }
 
 
-// ------------------------------------------------------------
-// BACKGROUND
-// ------------------------------------------------------------
+// ============================================================
+// BACKGROUND VIDEO
+// ============================================================
 
 const videos = [
     "https://cdn.coverr.co/videos/coverr-a-person-using-a-credit-card-1576/1080p.mp4",
@@ -3353,20 +4579,26 @@ function startVideo() {
     video.src =
         videos[videoIndex];
 
-    video.play().catch(() => {});
+    video.play().catch(
+        () => {}
+    );
 
     video.addEventListener(
         "ended",
         () => {
 
             videoIndex =
-                (videoIndex + 1) %
+                (
+                    videoIndex + 1
+                ) %
                 videos.length;
 
             video.src =
                 videos[videoIndex];
 
-            video.play().catch(() => {});
+            video.play().catch(
+                () => {}
+            );
 
         }
     );
@@ -3381,16 +4613,23 @@ startVideo();
 """
 
 
-# ------------------------------------------------------------
+# ============================================================
 # ADMIN LOGIN HTML
-# ------------------------------------------------------------
+# ============================================================
 
 ADMIN_LOGIN_HTML = r"""
 <!DOCTYPE html>
+
 <html>
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1">
+
 <title>Admin Login</title>
 
 <style>
@@ -3400,7 +4639,7 @@ body {
     min-height: 100vh;
     background: #07111f;
     color: white;
-    font-family: Arial, sans-serif;
+    font-family: Arial,sans-serif;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -3446,6 +4685,7 @@ button {
 }
 
 </style>
+
 </head>
 
 <body>
@@ -3455,7 +4695,11 @@ button {
 <h1>Admin</h1>
 
 {% if error %}
-<div class="error">{{ error }}</div>
+
+<div class="error">
+    {{ error }}
+</div>
+
 {% endif %}
 
 <form method="POST">
@@ -3480,24 +4724,27 @@ button {
 </div>
 
 </body>
+
 </html>
 """
 
 
-# ------------------------------------------------------------
+# ============================================================
 # ADMIN HTML
-# ------------------------------------------------------------
+# ============================================================
 
 ADMIN_HTML = r"""
 <!DOCTYPE html>
+
 <html>
 
 <head>
 
 <meta charset="UTF-8">
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1">
 
 <title>Kiosk Admin</title>
 
@@ -3507,7 +4754,7 @@ body {
     margin: 0;
     background: #07111f;
     color: white;
-    font-family: Arial, sans-serif;
+    font-family: Arial,sans-serif;
 }
 
 header {
@@ -3575,10 +4822,6 @@ button {
     color: white;
 }
 
-.status {
-    font-size: 18px;
-}
-
 </style>
 
 </head>
@@ -3587,28 +4830,29 @@ button {
 
 <header>
 
-<div>
-    <strong>KIOSK ADMIN</strong>
-</div>
+<strong>
+    KIOSK ADMIN
+</strong>
 
-<div>
-    <a
-       href="/admin/logout"
-       style="color:white;">
-       Logout
-    </a>
-</div>
+<a
+    href="/admin/logout"
+    style="color:white;">
+    Logout
+</a>
 
 </header>
 
 <main>
 
+
 <div class="card">
 
-<h2>Active Session</h2>
+<h2>
+    Active Session
+</h2>
 
 <div id="active">
-Loading...
+    Loading...
 </div>
 
 </div>
@@ -3616,9 +4860,9 @@ Loading...
 
 <div class="card">
 
-<h2>Products</h2>
-
-<div>
+<h2>
+    Products
+</h2>
 
 <input
     id="newName"
@@ -3636,25 +4880,26 @@ Loading...
     Add Product
 </button>
 
-</div>
-
-<br>
+<br><br>
 
 <table>
 
 <thead>
 
 <tr>
+
 <th>ID</th>
 <th>Name</th>
 <th>Price</th>
 <th>Active</th>
 <th>Action</th>
+
 </tr>
 
 </thead>
 
-<tbody id="products">
+<tbody
+    id="products">
 </tbody>
 
 </table>
@@ -3664,21 +4909,26 @@ Loading...
 
 <div class="card">
 
-<h2>Cards</h2>
+<h2>
+    Cards
+</h2>
 
 <table>
 
 <thead>
 
 <tr>
+
 <th>Card</th>
 <th>Balance</th>
 <th>Updated</th>
+
 </tr>
 
 </thead>
 
-<tbody id="cards">
+<tbody
+    id="cards">
 </tbody>
 
 </table>
@@ -3688,24 +4938,29 @@ Loading...
 
 <div class="card">
 
-<h2>Transactions</h2>
+<h2>
+    Transactions
+</h2>
 
 <table>
 
 <thead>
 
 <tr>
+
 <th>Time</th>
 <th>Card</th>
 <th>Type</th>
 <th>Amount</th>
 <th>Coins</th>
 <th>Description</th>
+
 </tr>
 
 </thead>
 
-<tbody id="transactions">
+<tbody
+    id="transactions">
 </tbody>
 
 </table>
@@ -3715,13 +4970,49 @@ Loading...
 
 <div class="card">
 
-<h2>Coin Events</h2>
+<h2>
+    Receipts
+</h2>
 
 <table>
 
 <thead>
 
 <tr>
+
+<th>Receipt</th>
+<th>Time</th>
+<th>Card</th>
+<th>Type</th>
+<th>Description</th>
+<th>Amount</th>
+<th>Balance</th>
+
+</tr>
+
+</thead>
+
+<tbody
+    id="receipts">
+</tbody>
+
+</table>
+
+</div>
+
+
+<div class="card">
+
+<h2>
+    Coin Events
+</h2>
+
+<table>
+
+<thead>
+
+<tr>
+
 <th>Time</th>
 <th>Kiosk</th>
 <th>Card</th>
@@ -3729,11 +5020,13 @@ Loading...
 <th>Coins</th>
 <th>Amount</th>
 <th>Reason</th>
+
 </tr>
 
 </thead>
 
-<tbody id="coins">
+<tbody
+    id="coins">
 </tbody>
 
 </table>
@@ -3746,18 +5039,24 @@ Loading...
 <script>
 
 function money(cents) {
+
     return "$" +
-        (Number(cents) / 100)
-        .toFixed(2);
+        (
+            Number(cents) /
+            100
+        ).toFixed(2);
 }
 
 
 function escapeHtml(value) {
 
     const div =
-        document.createElement("div");
+        document.createElement(
+            "div"
+        );
 
-    div.textContent = value;
+    div.textContent =
+        value;
 
     return div.innerHTML;
 }
@@ -3777,37 +5076,37 @@ async function load() {
     const data =
         await response.json();
 
+
     const active =
         document.getElementById(
             "active"
         );
 
-    if (data.active_session) {
+    if (
+        data.active_session
+    ) {
 
         const s =
             data.active_session;
 
         active.innerHTML = `
-            <div class="status">
-                ACTIVE
-            </div>
+            <p>
+                <strong>ACTIVE</strong>
+            </p>
+
             <p>
                 Card:
-                <strong>
-                    ${escapeHtml(s.card_id)}
-                </strong>
+                ${escapeHtml(s.card_id)}
             </p>
+
             <p>
                 Coins:
-                <strong>
-                    ${s.coin_count}
-                </strong>
+                ${s.coin_count}
             </p>
+
             <p>
                 Amount:
-                <strong>
-                    ${money(s.amount_cents)}
-                </strong>
+                ${money(s.amount_cents)}
             </p>
         `;
 
@@ -3825,50 +5124,59 @@ async function load() {
 
     products.innerHTML = "";
 
-    data.products.forEach(p => {
+    data.products.forEach(
+        p => {
 
-        products.innerHTML += `
-            <tr>
-                <td>${p.id}</td>
+            products.innerHTML += `
+                <tr>
 
-                <td>
-                    <input
-                        id="name-${p.id}"
-                        value="${escapeHtml(p.name)}">
-                </td>
+                    <td>
+                        ${p.id}
+                    </td>
 
-                <td>
-                    <input
-                        id="price-${p.id}"
-                        type="number"
-                        step="0.01"
-                        value="${(
-                            p.price_cents / 100
-                        ).toFixed(2)}">
-                </td>
+                    <td>
+                        <input
+                            id="name-${p.id}"
+                            value="${escapeHtml(p.name)}">
+                    </td>
 
-                <td>
-                    <input
-                        id="active-${p.id}"
-                        type="checkbox"
-                        ${p.active ? "checked" : ""}>
-                </td>
+                    <td>
+                        <input
+                            id="price-${p.id}"
+                            type="number"
+                            step="0.01"
+                            value="${(
+                                p.price_cents /
+                                100
+                            ).toFixed(2)}">
+                    </td>
 
-                <td>
-                    <button
-                        onclick="saveProduct(${p.id})">
-                        Save
-                    </button>
+                    <td>
+                        <input
+                            id="active-${p.id}"
+                            type="checkbox"
+                            ${p.active ? "checked" : ""}>
+                    </td>
 
-                    <button
-                        class="delete"
-                        onclick="deleteProduct(${p.id})">
-                        Deactivate
-                    </button>
-                </td>
-            </tr>
-        `;
-    });
+                    <td>
+
+                        <button
+                            onclick="saveProduct(${p.id})">
+                            Save
+                        </button>
+
+                        <button
+                            class="delete"
+                            onclick="deleteProduct(${p.id})">
+                            Deactivate
+                        </button>
+
+                    </td>
+
+                </tr>
+            `;
+        }
+    );
 
 
     const cards =
@@ -3878,24 +5186,28 @@ async function load() {
 
     cards.innerHTML = "";
 
-    data.cards.forEach(c => {
+    data.cards.forEach(
+        c => {
 
-        cards.innerHTML += `
-            <tr>
-                <td>
-                    ${escapeHtml(c.card_id)}
-                </td>
+            cards.innerHTML += `
+                <tr>
 
-                <td>
-                    ${money(c.balance_cents)}
-                </td>
+                    <td>
+                        ${escapeHtml(c.card_id)}
+                    </td>
 
-                <td>
-                    ${escapeHtml(c.updated_at)}
-                </td>
-            </tr>
-        `;
-    });
+                    <td>
+                        ${money(c.balance_cents)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(c.updated_at)}
+                    </td>
+
+                </tr>
+            `;
+        }
+    );
 
 
     const transactions =
@@ -3905,19 +5217,87 @@ async function load() {
 
     transactions.innerHTML = "";
 
-    data.transactions.forEach(t => {
+    data.transactions.forEach(
+        t => {
 
-        transactions.innerHTML += `
-            <tr>
-                <td>${escapeHtml(t.created_at)}</td>
-                <td>${escapeHtml(t.card_id)}</td>
-                <td>${escapeHtml(t.type)}</td>
-                <td>${money(t.amount_cents)}</td>
-                <td>${t.coins}</td>
-                <td>${escapeHtml(t.description)}</td>
-            </tr>
-        `;
-    });
+            transactions.innerHTML += `
+                <tr>
+
+                    <td>
+                        ${escapeHtml(t.created_at)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(t.card_id)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(t.type)}
+                    </td>
+
+                    <td>
+                        ${money(t.amount_cents)}
+                    </td>
+
+                    <td>
+                        ${t.coins}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(t.description)}
+                    </td>
+
+                </tr>
+            `;
+        }
+    );
+
+
+    const receipts =
+        document.getElementById(
+            "receipts"
+        );
+
+    receipts.innerHTML = "";
+
+    data.receipts.forEach(
+        r => {
+
+            receipts.innerHTML += `
+                <tr>
+
+                    <td>
+                        ${escapeHtml(r.receipt_number)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(r.created_at)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(r.card_id)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(r.type)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(r.description)}
+                    </td>
+
+                    <td>
+                        ${money(r.amount_cents)}
+                    </td>
+
+                    <td>
+                        ${money(r.balance_after_cents)}
+                    </td>
+
+                </tr>
+            `;
+        }
+    );
 
 
     const coins =
@@ -3927,20 +5307,46 @@ async function load() {
 
     coins.innerHTML = "";
 
-    data.coin_events.forEach(c => {
+    data.coin_events.forEach(
+        c => {
 
-        coins.innerHTML += `
-            <tr>
-                <td>${escapeHtml(c.created_at)}</td>
-                <td>${escapeHtml(c.kiosk_id)}</td>
-                <td>${escapeHtml(c.card_id || "-")}</td>
-                <td>${c.accepted ? "YES" : "NO"}</td>
-                <td>${c.coins}</td>
-                <td>${money(c.amount_cents)}</td>
-                <td>${escapeHtml(c.reason)}</td>
-            </tr>
-        `;
-    });
+            coins.innerHTML += `
+                <tr>
+
+                    <td>
+                        ${escapeHtml(c.created_at)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(c.kiosk_id)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            c.card_id || "-"
+                        )}
+                    </td>
+
+                    <td>
+                        ${c.accepted ? "YES" : "NO"}
+                    </td>
+
+                    <td>
+                        ${c.coins}
+                    </td>
+
+                    <td>
+                        ${money(c.amount_cents)}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(c.reason)}
+                    </td>
+
+                </tr>
+            `;
+        }
+    );
 }
 
 
@@ -3958,7 +5364,10 @@ async function addProduct() {
             ).value
         );
 
-    if (!name || price < 0) {
+    if (
+        !name ||
+        price < 0
+    ) {
         return;
     }
 
@@ -3970,13 +5379,14 @@ async function addProduct() {
                 "Content-Type":
                     "application/json"
             },
-            body: JSON.stringify({
-                name: name,
-                price_cents:
-                    Math.round(
-                        price * 100
-                    )
-            })
+            body:
+                JSON.stringify({
+                    name: name,
+                    price_cents:
+                        Math.round(
+                            price * 100
+                        )
+                })
         }
     );
 
@@ -4019,14 +5429,15 @@ async function saveProduct(id) {
                 "Content-Type":
                     "application/json"
             },
-            body: JSON.stringify({
-                name: name,
-                price_cents:
-                    Math.round(
-                        price * 100
-                    ),
-                active: active
-            })
+            body:
+                JSON.stringify({
+                    name: name,
+                    price_cents:
+                        Math.round(
+                            price * 100
+                        ),
+                    active: active
+                })
         }
     );
 
@@ -4062,9 +5473,498 @@ setInterval(
 """
 
 
-# ------------------------------------------------------------
+# ============================================================
+# BACKEND CONSOLE HTML
+# ============================================================
+
+BACK_HTML = r"""
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1">
+
+<title>Backend Console</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #050b12;
+    color: #d8e5f2;
+    font-family:
+        Consolas,
+        "Courier New",
+        monospace;
+}
+
+header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: #08131f;
+    border-bottom: 1px solid #1c3349;
+    padding: 18px 25px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.title {
+    color: #8dd8ff;
+    font-size: 20px;
+    font-weight: bold;
+}
+
+.live {
+    color: #71e39a;
+}
+
+main {
+    padding: 20px;
+    max-width: 1700px;
+    margin: auto;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        1fr 2fr;
+    gap: 20px;
+}
+
+.panel {
+    background: #091522;
+    border: 1px solid #1a3045;
+    border-radius: 12px;
+    padding: 18px;
+    margin-bottom: 20px;
+}
+
+.panel h2 {
+    margin-top: 0;
+    color: #8dd8ff;
+}
+
+.session {
+    font-size: 18px;
+    line-height: 1.8;
+}
+
+.log {
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.event {
+    padding: 9px 5px;
+    border-bottom: 1px solid #122536;
+}
+
+.event:hover {
+    background: #0d1c2a;
+}
+
+.time {
+    color: #687f93;
+}
+
+.type {
+    color: #8dd8ff;
+    font-weight: bold;
+}
+
+.amount {
+    color: #71e39a;
+}
+
+.receipt {
+    color: #d2a8ff;
+}
+
+.error {
+    color: #ff8585;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+<div class="title">
+    BACKEND CONSOLE — {{ kiosk_id }}
+</div>
+
+<div class="live">
+    LIVE
+</div>
+
+</header>
+
+<main>
+
+<div class="grid">
+
+<div>
+
+<div class="panel">
+
+<h2>
+    Current Session
+</h2>
+
+<div
+    class="session"
+    id="session">
+    Loading...
+</div>
+
+</div>
+
+<div class="panel">
+
+<h2>
+    Latest Receipts
+</h2>
+
+<div
+    class="log"
+    id="receipts">
+    Loading...
+</div>
+
+</div>
+
+</div>
+
+
+<div>
+
+<div class="panel">
+
+<h2>
+    Live Machine Activity
+</h2>
+
+<div
+    class="log"
+    id="events">
+    Loading...
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+</main>
+
+
+<script>
+
+let lastEventId = null;
+
+
+function escapeHtml(value) {
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+    div.textContent =
+        value;
+
+    return div.innerHTML;
+}
+
+
+function money(cents) {
+
+    return "$" +
+        (
+            Number(cents) /
+            100
+        ).toFixed(2);
+}
+
+
+async function load() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/back/live?t="
+                + Date.now(),
+                {
+                    cache:
+                        "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+
+        // SESSION
+
+        const session =
+            document.getElementById(
+                "session"
+            );
+
+        if (
+            data.active_session
+        ) {
+
+            const s =
+                data.active_session;
+
+            session.innerHTML = `
+                ACTIVE<br>
+                Card:
+                ${escapeHtml(s.card_id)}
+                <br>
+                Coins:
+                ${s.coin_count}
+                <br>
+                Amount:
+                ${money(s.amount_cents)}
+            `;
+
+        } else {
+
+            session.textContent =
+                "NO ACTIVE SESSION";
+        }
+
+
+        // EVENTS
+
+        const events =
+            [];
+
+        data.transactions.forEach(
+            item => {
+
+                events.push({
+                    id:
+                        "t-" +
+                        item.id,
+                    time:
+                        item.created_at,
+                    type:
+                        item.type,
+                    card:
+                        item.card_id,
+                    message:
+                        item.description,
+                    amount:
+                        item.amount_cents
+                });
+
+            }
+        );
+
+        data.coin_events.forEach(
+            item => {
+
+                events.push({
+                    id:
+                        "c-" +
+                        item.id,
+                    time:
+                        item.created_at,
+                    type:
+                        item.accepted
+                            ? "COIN"
+                            : "COIN REJECTED",
+                    card:
+                        item.card_id || "-",
+                    message:
+                        item.reason,
+                    amount:
+                        item.amount_cents
+                });
+
+            }
+        );
+
+
+        events.sort(
+            (a,b) =>
+                b.id.localeCompare(
+                    a.id
+                )
+        );
+
+
+        const eventBox =
+            document.getElementById(
+                "events"
+            );
+
+        eventBox.innerHTML =
+            events
+                .slice(0,100)
+                .map(
+                    e => {
+
+                        let amount =
+                            "";
+
+                        if (
+                            e.amount !== 0
+                        ) {
+
+                            amount =
+                                `<span class="amount">
+                                    ${money(e.amount)}
+                                </span>`;
+                        }
+
+                        const typeClass =
+                            e.type.includes(
+                                "REJECTED"
+                            )
+                            ? "error"
+                            : "type";
+
+                        return `
+                            <div class="event">
+
+                                <span class="time">
+                                    ${escapeHtml(e.time)}
+                                </span>
+
+                                &nbsp;
+
+                                <span class="${typeClass}">
+                                    ${escapeHtml(e.type)}
+                                </span>
+
+                                &nbsp;
+
+                                KIOSK1
+
+                                &nbsp;
+
+                                CARD:
+                                ${escapeHtml(e.card)}
+
+                                &nbsp;
+
+                                ${escapeHtml(e.message)}
+
+                                &nbsp;
+
+                                ${amount}
+
+                            </div>
+                        `;
+                    }
+                )
+                .join("");
+
+
+        // RECEIPTS
+
+        const receiptBox =
+            document.getElementById(
+                "receipts"
+            );
+
+        receiptBox.innerHTML =
+            data.receipts
+                .slice(0,30)
+                .map(
+                    r => {
+
+                        return `
+                            <div class="event">
+
+                                <span class="time">
+                                    ${escapeHtml(r.created_at)}
+                                </span>
+
+                                <br>
+
+                                <span class="receipt">
+                                    ${escapeHtml(
+                                        r.receipt_number
+                                    )}
+                                </span>
+
+                                <br>
+
+                                CARD:
+                                ${escapeHtml(r.card_id)}
+
+                                <br>
+
+                                ${escapeHtml(
+                                    r.description
+                                )}
+
+                                &nbsp;
+
+                                ${money(
+                                    r.amount_cents
+                                )}
+
+                                <br>
+
+                                BALANCE:
+                                ${money(
+                                    r.balance_after_cents
+                                )}
+
+                            </div>
+                        `;
+                    }
+                )
+                .join("");
+
+    } catch (error) {
+
+        console.error(error);
+    }
+}
+
+
+load();
+
+setInterval(
+    load,
+    500
+);
+
+</script>
+
+</body>
+
+</html>
+"""
+
+
+# ============================================================
 # RUN
-# ------------------------------------------------------------
+# ============================================================
 
 if __name__ == "__main__":
 
