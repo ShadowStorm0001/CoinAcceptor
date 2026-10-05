@@ -72,11 +72,17 @@ def get_db():
 
         return conn
 
-    return sqlite3.connect(
+    conn = sqlite3.connect(
         DB_FILE,
         timeout=30,
         check_same_thread=False
     )
+
+    # IMPORTANT:
+    # Make SQLite rows behave like dictionaries.
+    conn.row_factory = sqlite3.Row
+
+    return conn
 
 
 def close_db(conn):
@@ -251,14 +257,9 @@ def init_db():
 
             conn.commit()
 
-            if DB_TYPE == "postgres":
-                cur.execute(
-                    "SELECT COUNT(*) FROM products"
-                )
-            else:
-                cur.execute(
-                    "SELECT COUNT(*) FROM products"
-                )
+            cur.execute(
+                "SELECT COUNT(*) FROM products"
+            )
 
             count = cur.fetchone()[0]
 
@@ -330,7 +331,11 @@ def query_one(sql, params=()):
         try:
 
             cur = conn.cursor()
-            cur.execute(sql, params)
+
+            cur.execute(
+                sql,
+                params
+            )
 
             row = cur.fetchone()
 
@@ -348,7 +353,18 @@ def query_one(sql, params=()):
                     zip(columns, row)
                 )
 
-            return dict(row)
+            # SQLite now uses sqlite3.Row.
+            if isinstance(row, sqlite3.Row):
+                return dict(row)
+
+            columns = [
+                item[0]
+                for item in cur.description
+            ]
+
+            return dict(
+                zip(columns, row)
+            )
 
         finally:
             close_db(conn)
@@ -363,7 +379,11 @@ def query_all(sql, params=()):
         try:
 
             cur = conn.cursor()
-            cur.execute(sql, params)
+
+            cur.execute(
+                sql,
+                params
+            )
 
             rows = cur.fetchall()
 
@@ -376,6 +396,15 @@ def query_all(sql, params=()):
 
                 return [
                     dict(zip(columns, row))
+                    for row in rows
+                ]
+
+            if rows and isinstance(
+                rows[0],
+                sqlite3.Row
+            ):
+                return [
+                    dict(row)
                     for row in rows
                 ]
 
@@ -402,24 +431,38 @@ def execute(sql, params=()):
         try:
 
             cur = conn.cursor()
-            cur.execute(sql, params)
 
-            conn.commit()
+            cur.execute(
+                sql,
+                params
+            )
 
             if DB_TYPE == "postgres":
 
+                result = None
+
                 try:
+
                     row = cur.fetchone()
 
                     if row:
-                        return row[0]
+                        result = row[0]
 
                 except Exception:
-                    pass
+                    result = None
 
-                return None
+                conn.commit()
+
+                return result
+
+            conn.commit()
 
             return cur.lastrowid
+
+        except Exception:
+
+            conn.rollback()
+            raise
 
         finally:
             close_db(conn)
@@ -610,7 +653,8 @@ def close_active_session():
 
         execute("""
             UPDATE sessions
-            SET status = 'cancelled',
+            SET
+                status = 'cancelled',
                 updated_at = ?
             WHERE kiosk_id = ?
             AND status = 'active'
@@ -623,7 +667,8 @@ def close_active_session():
 
         execute("""
             UPDATE sessions
-            SET status = 'cancelled',
+            SET
+                status = 'cancelled',
                 updated_at = %s
             WHERE kiosk_id = %s
             AND status = 'active'
@@ -796,6 +841,13 @@ def kiosk_scan():
     card = ensure_card(
         card_id
     )
+
+    if not card:
+
+        return jsonify({
+            "success": False,
+            "error": "CARD_ERROR"
+        }), 500
 
     create_machine_log(
         "CARD_SCAN",
@@ -2028,6 +2080,14 @@ def admin_product_create():
                 "NAME_REQUIRED"
         }), 400
 
+    if price_cents < 0:
+
+        return jsonify({
+            "success": False,
+            "error":
+                "INVALID_PRICE"
+        }), 400
+
     now = utc_now()
 
     if DB_TYPE == "sqlite":
@@ -2111,6 +2171,22 @@ def admin_product_update(
         )
 
     except Exception:
+
+        return jsonify({
+            "success": False,
+            "error":
+                "INVALID_PRICE"
+        }), 400
+
+    if not name:
+
+        return jsonify({
+            "success": False,
+            "error":
+                "NAME_REQUIRED"
+        }), 400
+
+    if price_cents < 0:
 
         return jsonify({
             "success": False,
@@ -2262,6 +2338,41 @@ def backend_live():
         "coin_events": coin_events,
         "receipts": receipts
     })
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/health")
+def health():
+
+    try:
+
+        if DB_TYPE == "sqlite":
+
+            query_one("""
+                SELECT 1 AS test
+            """)
+
+        else:
+
+            query_one("""
+                SELECT 1 AS test
+            """)
+
+        return jsonify({
+            "success": True,
+            "database": DB_TYPE,
+            "kiosk_id": KIOSK_ID
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # ============================================================
@@ -3150,7 +3261,7 @@ body {
         <div
             class="title"
             data-en="Scan the new card again"
-            data-zh="请再次刷新卡片">
+            data-zh="请再次刷卡">
             Scan the new card again
         </div>
 
@@ -3691,7 +3802,9 @@ function focusInput(id) {
 
     setTimeout(
         () => {
+
             input.focus();
+
         },
         100
     );
@@ -3836,8 +3949,30 @@ async function handleInitialScan(
                 }
             );
 
-        const data =
-            await response.json();
+        const responseText =
+            await response.text();
+
+        let data;
+
+        try {
+
+            data =
+                JSON.parse(
+                    responseText
+                );
+
+        } catch {
+
+            throw new Error(
+                "HTTP " +
+                response.status +
+                ": " +
+                responseText.slice(
+                    0,
+                    250
+                )
+            );
+        }
 
         if (
             !response.ok ||
@@ -3882,6 +4017,11 @@ async function handleInitialScan(
         }
 
     } catch (error) {
+
+        console.error(
+            "Card scan error:",
+            error
+        );
 
         showError(
             language === "en"
@@ -4015,6 +4155,11 @@ async function handleChargeFinishScan(
 
     } catch (error) {
 
+        console.error(
+            "Charge confirmation error:",
+            error
+        );
+
         showError(
             language === "en"
                 ? "Unable to contact the server."
@@ -4042,8 +4187,24 @@ function startChargePolling() {
                     }
                 );
 
-            const data =
-                await response.json();
+            const responseText =
+                await response.text();
+
+            let data;
+
+            try {
+
+                data =
+                    JSON.parse(
+                        responseText
+                    );
+
+            } catch {
+
+                throw new Error(
+                    "Invalid server response"
+                );
+            }
 
             if (
                 data.active &&
@@ -4188,6 +4349,11 @@ async function handleDifferentConfirmScan(
 
     } catch (error) {
 
+        console.error(
+            "Different card confirmation error:",
+            error
+        );
+
         showError(
             language === "en"
                 ? "Unable to contact the server."
@@ -4324,6 +4490,16 @@ async function loadStore(data) {
         const products =
             await response.json();
 
+        if (
+            !response.ok ||
+            !products.success
+        ) {
+
+            throw new Error(
+                "Unable to load products"
+            );
+        }
+
         const container =
             document.getElementById(
                 "products"
@@ -4375,6 +4551,10 @@ async function loadStore(data) {
         );
 
     } catch (error) {
+
+        console.error(
+            error
+        );
 
         showError(
             language === "en"
@@ -4445,6 +4625,11 @@ async function buyProduct(
         );
 
     } catch (error) {
+
+        console.error(
+            "Purchase error:",
+            error
+        );
 
         showError(
             language === "en"
@@ -5064,289 +5249,304 @@ function escapeHtml(value) {
 
 async function load() {
 
-    const response =
-        await fetch(
-            "/api/admin/live"
+    try {
+
+        const response =
+            await fetch(
+                "/api/admin/live?t="
+                + Date.now(),
+                {
+                    cache:
+                        "no-store"
+                }
+            );
+
+        if (!response.ok) {
+            return;
+        }
+
+        const data =
+            await response.json();
+
+
+        const active =
+            document.getElementById(
+                "active"
+            );
+
+        if (
+            data.active_session
+        ) {
+
+            const s =
+                data.active_session;
+
+            active.innerHTML = `
+                <p>
+                    <strong>ACTIVE</strong>
+                </p>
+
+                <p>
+                    Card:
+                    ${escapeHtml(s.card_id)}
+                </p>
+
+                <p>
+                    Coins:
+                    ${s.coin_count}
+                </p>
+
+                <p>
+                    Amount:
+                    ${money(s.amount_cents)}
+                </p>
+            `;
+
+        } else {
+
+            active.textContent =
+                "No active session.";
+        }
+
+
+        const products =
+            document.getElementById(
+                "products"
+            );
+
+        products.innerHTML = "";
+
+        data.products.forEach(
+            p => {
+
+                products.innerHTML += `
+                    <tr>
+
+                        <td>
+                            ${p.id}
+                        </td>
+
+                        <td>
+                            <input
+                                id="name-${p.id}"
+                                value="${escapeHtml(p.name)}">
+                        </td>
+
+                        <td>
+                            <input
+                                id="price-${p.id}"
+                                type="number"
+                                step="0.01"
+                                value="${(
+                                    p.price_cents /
+                                    100
+                                ).toFixed(2)}">
+                        </td>
+
+                        <td>
+                            <input
+                                id="active-${p.id}"
+                                type="checkbox"
+                                ${p.active ? "checked" : ""}>
+                        </td>
+
+                        <td>
+
+                            <button
+                                onclick="saveProduct(${p.id})">
+                                Save
+                            </button>
+
+                            <button
+                                class="delete"
+                                onclick="deleteProduct(${p.id})">
+                                Deactivate
+                            </button>
+
+                        </td>
+
+                    </tr>
+                `;
+            }
         );
 
-    if (!response.ok) {
-        return;
+
+        const cards =
+            document.getElementById(
+                "cards"
+            );
+
+        cards.innerHTML = "";
+
+        data.cards.forEach(
+            c => {
+
+                cards.innerHTML += `
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(c.card_id)}
+                        </td>
+
+                        <td>
+                            ${money(c.balance_cents)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(c.updated_at)}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        );
+
+
+        const transactions =
+            document.getElementById(
+                "transactions"
+            );
+
+        transactions.innerHTML = "";
+
+        data.transactions.forEach(
+            t => {
+
+                transactions.innerHTML += `
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(t.created_at)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(t.card_id)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(t.type)}
+                        </td>
+
+                        <td>
+                            ${money(t.amount_cents)}
+                        </td>
+
+                        <td>
+                            ${t.coins}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(t.description)}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        );
+
+
+        const receipts =
+            document.getElementById(
+                "receipts"
+            );
+
+        receipts.innerHTML = "";
+
+        data.receipts.forEach(
+            r => {
+
+                receipts.innerHTML += `
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(r.receipt_number)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(r.created_at)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(r.card_id)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(r.type)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(r.description)}
+                        </td>
+
+                        <td>
+                            ${money(r.amount_cents)}
+                        </td>
+
+                        <td>
+                            ${money(r.balance_after_cents)}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        );
+
+
+        const coins =
+            document.getElementById(
+                "coins"
+            );
+
+        coins.innerHTML = "";
+
+        data.coin_events.forEach(
+            c => {
+
+                coins.innerHTML += `
+                    <tr>
+
+                        <td>
+                            ${escapeHtml(c.created_at)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(c.kiosk_id)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                c.card_id || "-"
+                            )}
+                        </td>
+
+                        <td>
+                            ${c.accepted ? "YES" : "NO"}
+                        </td>
+
+                        <td>
+                            ${c.coins}
+                        </td>
+
+                        <td>
+                            ${money(c.amount_cents)}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(c.reason)}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Admin loading error:",
+            error
+        );
     }
-
-    const data =
-        await response.json();
-
-
-    const active =
-        document.getElementById(
-            "active"
-        );
-
-    if (
-        data.active_session
-    ) {
-
-        const s =
-            data.active_session;
-
-        active.innerHTML = `
-            <p>
-                <strong>ACTIVE</strong>
-            </p>
-
-            <p>
-                Card:
-                ${escapeHtml(s.card_id)}
-            </p>
-
-            <p>
-                Coins:
-                ${s.coin_count}
-            </p>
-
-            <p>
-                Amount:
-                ${money(s.amount_cents)}
-            </p>
-        `;
-
-    } else {
-
-        active.textContent =
-            "No active session.";
-    }
-
-
-    const products =
-        document.getElementById(
-            "products"
-        );
-
-    products.innerHTML = "";
-
-    data.products.forEach(
-        p => {
-
-            products.innerHTML += `
-                <tr>
-
-                    <td>
-                        ${p.id}
-                    </td>
-
-                    <td>
-                        <input
-                            id="name-${p.id}"
-                            value="${escapeHtml(p.name)}">
-                    </td>
-
-                    <td>
-                        <input
-                            id="price-${p.id}"
-                            type="number"
-                            step="0.01"
-                            value="${(
-                                p.price_cents /
-                                100
-                            ).toFixed(2)}">
-                    </td>
-
-                    <td>
-                        <input
-                            id="active-${p.id}"
-                            type="checkbox"
-                            ${p.active ? "checked" : ""}>
-                    </td>
-
-                    <td>
-
-                        <button
-                            onclick="saveProduct(${p.id})">
-                            Save
-                        </button>
-
-                        <button
-                            class="delete"
-                            onclick="deleteProduct(${p.id})">
-                            Deactivate
-                        </button>
-
-                    </td>
-
-                </tr>
-            `;
-        }
-    );
-
-
-    const cards =
-        document.getElementById(
-            "cards"
-        );
-
-    cards.innerHTML = "";
-
-    data.cards.forEach(
-        c => {
-
-            cards.innerHTML += `
-                <tr>
-
-                    <td>
-                        ${escapeHtml(c.card_id)}
-                    </td>
-
-                    <td>
-                        ${money(c.balance_cents)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(c.updated_at)}
-                    </td>
-
-                </tr>
-            `;
-        }
-    );
-
-
-    const transactions =
-        document.getElementById(
-            "transactions"
-        );
-
-    transactions.innerHTML = "";
-
-    data.transactions.forEach(
-        t => {
-
-            transactions.innerHTML += `
-                <tr>
-
-                    <td>
-                        ${escapeHtml(t.created_at)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(t.card_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(t.type)}
-                    </td>
-
-                    <td>
-                        ${money(t.amount_cents)}
-                    </td>
-
-                    <td>
-                        ${t.coins}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(t.description)}
-                    </td>
-
-                </tr>
-            `;
-        }
-    );
-
-
-    const receipts =
-        document.getElementById(
-            "receipts"
-        );
-
-    receipts.innerHTML = "";
-
-    data.receipts.forEach(
-        r => {
-
-            receipts.innerHTML += `
-                <tr>
-
-                    <td>
-                        ${escapeHtml(r.receipt_number)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(r.created_at)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(r.card_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(r.type)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(r.description)}
-                    </td>
-
-                    <td>
-                        ${money(r.amount_cents)}
-                    </td>
-
-                    <td>
-                        ${money(r.balance_after_cents)}
-                    </td>
-
-                </tr>
-            `;
-        }
-    );
-
-
-    const coins =
-        document.getElementById(
-            "coins"
-        );
-
-    coins.innerHTML = "";
-
-    data.coin_events.forEach(
-        c => {
-
-            coins.innerHTML += `
-                <tr>
-
-                    <td>
-                        ${escapeHtml(c.created_at)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(c.kiosk_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(
-                            c.card_id || "-"
-                        )}
-                    </td>
-
-                    <td>
-                        ${c.accepted ? "YES" : "NO"}
-                    </td>
-
-                    <td>
-                        ${c.coins}
-                    </td>
-
-                    <td>
-                        ${money(c.amount_cents)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(c.reason)}
-                    </td>
-
-                </tr>
-            `;
-        }
-    );
 }
 
 
@@ -5676,9 +5876,6 @@ main {
 
 <script>
 
-let lastEventId = null;
-
-
 function escapeHtml(value) {
 
     const div =
@@ -5766,6 +5963,8 @@ async function load() {
                     id:
                         "t-" +
                         item.id,
+                    numericId:
+                        Number(item.id),
                     time:
                         item.created_at,
                     type:
@@ -5788,6 +5987,8 @@ async function load() {
                     id:
                         "c-" +
                         item.id,
+                    numericId:
+                        Number(item.id),
                     time:
                         item.created_at,
                     type:
@@ -5808,9 +6009,11 @@ async function load() {
 
         events.sort(
             (a,b) =>
-                b.id.localeCompare(
-                    a.id
-                )
+                b.time.localeCompare(
+                    a.time
+                ) ||
+                b.numericId -
+                a.numericId
         );
 
 
@@ -5942,7 +6145,9 @@ async function load() {
 
     } catch (error) {
 
-        console.error(error);
+        console.error(
+            error
+        );
     }
 }
 
