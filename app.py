@@ -1,40 +1,45 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, session
+from flask import Flask, request, jsonify, session, redirect, render_template_string
 import sqlite3
+import os
+import time
 from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = "service-kiosk-secret"
+app.secret_key = "kiosk-secret-key-change-this"
 
 DB_FILE = "kiosk.db"
-
+KIOSK_ID = "KIOSK1"
+COIN_VALUE_CENTS = 100
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
 
-KIOSK_ID = "KIOSK-01"
+# Replace these only if you want different stock videos.
+# The kiosk will automatically fall back to the animated background
+# if a video cannot be loaded.
+STOCK_VIDEOS = [
+    "https://cdn.coverr.co/videos/coverr-a-person-using-a-credit-card-1576/1080p.mp4",
+    "https://cdn.coverr.co/videos/coverr-paying-with-a-credit-card-1577/1080p.mp4"
+]
 
-# One coin pulse = $1.00
-COIN_VALUE_CENTS = 100
 
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def get_db():
+def db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def timestamp():
+def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def init_database():
-    conn = get_db()
-    cur = conn.cursor()
+def money(cents):
+    return f"${cents / 100:.2f}"
 
-    cur.execute("""
+
+def init_db():
+    conn = db()
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             card_id TEXT PRIMARY KEY,
             balance_cents INTEGER NOT NULL DEFAULT 0,
@@ -43,7 +48,7 @@ def init_database():
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kiosk_id TEXT NOT NULL,
@@ -57,10 +62,10 @@ def init_database():
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kiosk_id TEXT,
+            kiosk_id TEXT NOT NULL,
             card_id TEXT,
             type TEXT NOT NULL,
             amount_cents INTEGER NOT NULL DEFAULT 0,
@@ -70,7 +75,7 @@ def init_database():
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS coin_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kiosk_id TEXT NOT NULL,
@@ -83,7 +88,7 @@ def init_database():
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -92,76 +97,21 @@ def init_database():
         )
     """)
 
-    if cur.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-        cur.execute(
-            "INSERT INTO products (name, price_cents) VALUES (?, ?)",
-            ("Service 1", 200)
-        )
-        cur.execute(
-            "INSERT INTO products (name, price_cents) VALUES (?, ?)",
-            ("Service 2", 500)
-        )
-        cur.execute(
-            "INSERT INTO products (name, price_cents) VALUES (?, ?)",
-            ("Service 3", 1000)
+    if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+        conn.executemany(
+            "INSERT INTO products (name, price_cents, active) VALUES (?, ?, 1)",
+            [
+                ("Service 1", 200),
+                ("Service 2", 500),
+                ("Service 3", 1000)
+            ]
         )
 
     conn.commit()
     conn.close()
 
 
-init_database()
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def money(cents):
-    return f"${cents / 100:.2f}"
-
-
-def create_card(conn, card_id):
-    card_id = str(card_id).strip()
-
-    if not card_id:
-        return None
-
-    card = conn.execute(
-        "SELECT * FROM cards WHERE card_id = ?",
-        (card_id,)
-    ).fetchone()
-
-    if card is None:
-        t = timestamp()
-
-        conn.execute("""
-            INSERT INTO cards
-            (card_id, balance_cents, created_at, updated_at)
-            VALUES (?, 0, ?, ?)
-        """, (card_id, t, t))
-
-        conn.commit()
-
-        card = conn.execute(
-            "SELECT * FROM cards WHERE card_id = ?",
-            (card_id,)
-        ).fetchone()
-
-    return card
-
-
-def close_sessions(conn, kiosk_id):
-    conn.execute("""
-        UPDATE sessions
-        SET status = 'closed',
-            updated_at = ?
-        WHERE kiosk_id = ?
-        AND status = 'active'
-    """, (timestamp(), kiosk_id))
-
-
-def active_session(conn, kiosk_id):
+def get_active_session(conn, kiosk_id):
     return conn.execute("""
         SELECT *
         FROM sessions
@@ -172,994 +122,2604 @@ def active_session(conn, kiosk_id):
     """, (kiosk_id,)).fetchone()
 
 
-# ============================================================
-# KIOSK HTML
-# ============================================================
+def create_card(conn, card_id):
+    existing = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (card_id,)
+    ).fetchone()
+
+    if not existing:
+        timestamp = now()
+        conn.execute("""
+            INSERT INTO cards
+            (card_id, balance_cents, created_at, updated_at)
+            VALUES (?, 0, ?, ?)
+        """, (card_id, timestamp, timestamp))
+
+
+def close_active_sessions(conn, kiosk_id):
+    conn.execute("""
+        UPDATE sessions
+        SET status = 'closed', updated_at = ?
+        WHERE kiosk_id = ?
+        AND status = 'active'
+    """, (now(), kiosk_id))
+
+
+init_db()
+
+
+@app.route("/")
+def index():
+    return redirect("/kiosk")
+
+
+@app.route("/kiosk")
+def kiosk():
+    return render_template_string(KIOSK_HTML, videos=STOCK_VIDEOS)
+
+
+@app.route("/api/kiosk/scan", methods=["POST"])
+def scan_card():
+    data = request.get_json(silent=True) or {}
+
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+    card_id = str(data.get("card_id", "")).strip()
+    mode = str(data.get("mode", "balance")).strip().lower()
+
+    if not card_id:
+        return jsonify({
+            "success": False,
+            "message": "No card detected"
+        }), 400
+
+    if mode not in ("charge", "balance", "store"):
+        return jsonify({
+            "success": False,
+            "message": "Invalid mode"
+        }), 400
+
+    conn = db()
+
+    create_card(conn, card_id)
+
+    if mode == "charge":
+        close_active_sessions(conn, kiosk_id)
+
+        timestamp = now()
+
+        cursor = conn.execute("""
+            INSERT INTO sessions
+            (kiosk_id, card_id, mode, status, coin_count,
+             amount_cents, created_at, updated_at)
+            VALUES (?, ?, 'charge', 'active', 0, 0, ?, ?)
+        """, (
+            kiosk_id,
+            card_id,
+            timestamp,
+            timestamp
+        ))
+
+        session_id = cursor.lastrowid
+
+    else:
+        session_id = None
+
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (card_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "kiosk_id": kiosk_id,
+        "card_id": card_id,
+        "balance_cents": card["balance_cents"],
+        "balance": money(card["balance_cents"]),
+        "session_id": session_id,
+        "mode": mode
+    })
+
+
+@app.route("/api/kiosk/state")
+def kiosk_state():
+    kiosk_id = request.args.get("kiosk_id", KIOSK_ID)
+
+    conn = db()
+    active = get_active_session(conn, kiosk_id)
+
+    if not active:
+        conn.close()
+        return jsonify({
+            "active": False
+        })
+
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (active["card_id"],)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "active": True,
+        "session_id": active["id"],
+        "card_id": active["card_id"],
+        "coin_count": active["coin_count"],
+        "amount_cents": active["amount_cents"],
+        "amount": money(active["amount_cents"]),
+        "balance_cents": card["balance_cents"],
+        "balance": money(card["balance_cents"])
+    })
+
+
+@app.route("/api/coin", methods=["POST"])
+def coin():
+    data = request.get_json(silent=True) or {}
+
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+
+    try:
+        coins = int(data.get("coins", 1))
+    except:
+        coins = 1
+
+    if coins < 1:
+        coins = 1
+
+    amount = coins * COIN_VALUE_CENTS
+    timestamp = now()
+
+    conn = db()
+
+    active = get_active_session(conn, kiosk_id)
+
+    if not active:
+        conn.execute("""
+            INSERT INTO coin_events
+            (kiosk_id, card_id, accepted, coins, amount_cents,
+             reason, created_at)
+            VALUES (?, NULL, 0, ?, ?, ?, ?)
+        """, (
+            kiosk_id,
+            coins,
+            amount,
+            "NO_ACTIVE_CARD_SESSION",
+            timestamp
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "accepted": False,
+            "reason": "NO_ACTIVE_CARD_SESSION"
+        }), 409
+
+    card_id = active["card_id"]
+
+    new_coin_count = active["coin_count"] + coins
+    new_amount = active["amount_cents"] + amount
+
+    conn.execute("""
+        UPDATE sessions
+        SET coin_count = ?,
+            amount_cents = ?,
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        new_coin_count,
+        new_amount,
+        timestamp,
+        active["id"]
+    ))
+
+    conn.execute("""
+        INSERT INTO coin_events
+        (kiosk_id, card_id, accepted, coins, amount_cents,
+         reason, created_at)
+        VALUES (?, ?, 1, ?, ?, ?, ?)
+    """, (
+        kiosk_id,
+        card_id,
+        coins,
+        amount,
+        "ACTIVE_CHARGE_SESSION",
+        timestamp
+    ))
+
+    conn.commit()
+
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (card_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "accepted": True,
+        "card_id": card_id,
+        "coin_count": new_coin_count,
+        "amount_cents": new_amount,
+        "amount": money(new_amount),
+        "balance_cents": card["balance_cents"],
+        "balance": money(card["balance_cents"])
+    })
+
+
+@app.route("/api/kiosk/confirm-charge", methods=["POST"])
+def confirm_charge():
+    data = request.get_json(silent=True) or {}
+
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+    scanned_card = str(data.get("card_id", "")).strip()
+
+    if not scanned_card:
+        return jsonify({
+            "success": False,
+            "message": "Please scan a card"
+        }), 400
+
+    conn = db()
+
+    active = get_active_session(conn, kiosk_id)
+
+    if not active:
+        conn.close()
+        return jsonify({
+            "success": False,
+            "message": "No active charge session"
+        }), 409
+
+    if active["card_id"] != scanned_card:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "different_card": True,
+            "original_card": active["card_id"],
+            "scanned_card": scanned_card,
+            "message": "A different card was detected"
+        }), 409
+
+    if active["amount_cents"] <= 0:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "No coins have been inserted"
+        }), 400
+
+    amount = active["amount_cents"]
+    card_id = active["card_id"]
+    timestamp = now()
+
+    conn.execute("""
+        UPDATE cards
+        SET balance_cents = balance_cents + ?,
+            updated_at = ?
+        WHERE card_id = ?
+    """, (
+        amount,
+        timestamp,
+        card_id
+    ))
+
+    conn.execute("""
+        INSERT INTO transactions
+        (kiosk_id, card_id, type, amount_cents, coins,
+         description, created_at)
+        VALUES (?, ?, 'charge', ?, ?, ?, ?)
+    """, (
+        kiosk_id,
+        card_id,
+        amount,
+        active["coin_count"],
+        "Card charged",
+        timestamp
+    ))
+
+    conn.execute("""
+        UPDATE sessions
+        SET status = 'completed',
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        timestamp,
+        active["id"]
+    ))
+
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (card_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "card_id": card_id,
+        "added_cents": amount,
+        "added": money(amount),
+        "balance_cents": card["balance_cents"],
+        "balance": money(card["balance_cents"])
+    })
+
+
+@app.route("/api/kiosk/confirm-different-card", methods=["POST"])
+def confirm_different_card():
+    data = request.get_json(silent=True) or {}
+
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+    card_id = str(data.get("card_id", "")).strip()
+
+    if not card_id:
+        return jsonify({
+            "success": False,
+            "message": "Please scan a card"
+        }), 400
+
+    conn = db()
+
+    active = get_active_session(conn, kiosk_id)
+
+    if not active:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "Session expired"
+        }), 409
+
+    if active["amount_cents"] <= 0:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "No amount is waiting to be transferred"
+        }), 400
+
+    create_card(conn, card_id)
+
+    amount = active["amount_cents"]
+    timestamp = now()
+
+    conn.execute("""
+        UPDATE cards
+        SET balance_cents = balance_cents + ?,
+            updated_at = ?
+        WHERE card_id = ?
+    """, (
+        amount,
+        timestamp,
+        card_id
+    ))
+
+    conn.execute("""
+        INSERT INTO transactions
+        (kiosk_id, card_id, type, amount_cents, coins,
+         description, created_at)
+        VALUES (?, ?, 'charge', ?, ?, ?, ?)
+    """, (
+        kiosk_id,
+        card_id,
+        amount,
+        active["coin_count"],
+        "Card charged after different-card confirmation",
+        timestamp
+    ))
+
+    conn.execute("""
+        UPDATE sessions
+        SET status = 'completed',
+            updated_at = ?
+        WHERE id = ?
+    """, (
+        timestamp,
+        active["id"]
+    ))
+
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ?",
+        (card_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "card_id": card_id,
+        "added_cents": amount,
+        "added": money(amount),
+        "balance_cents": card["balance_cents"],
+        "balance": money(card["balance_cents"])
+    })
+
+
+@app.route("/api/store/products")
+def products():
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM products
+        WHERE active = 1
+        ORDER BY id
+    """).fetchall()
+
+    conn.close()
+
+    return jsonify([
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "price_cents": row["price_cents"],
+            "price": money(row["price_cents"])
+        }
+        for row in rows
+    ])
+
+
+@app.route("/api/store/buy", methods=["POST"])
+def buy():
+    data = request.get_json(silent=True) or {}
+
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+    card_id = str(data.get("card_id", "")).strip()
+
+    try:
+        product_id = int(data.get("product_id"))
+    except:
+        return jsonify({
+            "success": False,
+            "message": "Invalid product"
+        }), 400
+
+    conn = db()
+
+    product = conn.execute("""
+        SELECT *
+        FROM products
+        WHERE id = ?
+        AND active = 1
+    """, (product_id,)).fetchone()
+
+    if not product:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "Product unavailable"
+        }), 404
+
+    card = conn.execute("""
+        SELECT *
+        FROM cards
+        WHERE card_id = ?
+    """, (card_id,)).fetchone()
+
+    if not card:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "Card not found"
+        }), 404
+
+    if card["balance_cents"] < product["price_cents"]:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "insufficient": True,
+            "balance_cents": card["balance_cents"],
+            "balance": money(card["balance_cents"]),
+            "required_cents": product["price_cents"],
+            "required": money(product["price_cents"])
+        }), 409
+
+    timestamp = now()
+
+    conn.execute("""
+        UPDATE cards
+        SET balance_cents = balance_cents - ?,
+            updated_at = ?
+        WHERE card_id = ?
+    """, (
+        product["price_cents"],
+        timestamp,
+        card_id
+    ))
+
+    conn.execute("""
+        INSERT INTO transactions
+        (kiosk_id, card_id, type, amount_cents, coins,
+         description, created_at)
+        VALUES (?, ?, 'purchase', ?, 0, ?, ?)
+    """, (
+        kiosk_id,
+        card_id,
+        -product["price_cents"],
+        product["name"],
+        timestamp
+    ))
+
+    new_balance = card["balance_cents"] - product["price_cents"]
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "product": product["name"],
+        "price_cents": product["price_cents"],
+        "price": money(product["price_cents"]),
+        "balance_cents": new_balance,
+        "balance": money(new_balance)
+    })
+
+
+@app.route("/api/kiosk/end", methods=["POST"])
+def end_session():
+    data = request.get_json(silent=True) or {}
+    kiosk_id = str(data.get("kiosk_id", KIOSK_ID)).strip()
+
+    conn = db()
+
+    conn.execute("""
+        UPDATE sessions
+        SET status = 'closed',
+            updated_at = ?
+        WHERE kiosk_id = ?
+        AND status = 'active'
+    """, (
+        now(),
+        kiosk_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True
+    })
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect("/admin")
+
+    return render_template_string(ADMIN_LOGIN_HTML)
+
+
+@app.route("/admin")
+def admin():
+    if not session.get("admin"):
+        return redirect("/admin/login")
+
+    return render_template_string(ADMIN_HTML)
+
+
+@app.route("/api/admin/live")
+def admin_live():
+    if not session.get("admin"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    conn = db()
+
+    sessions = conn.execute("""
+        SELECT *
+        FROM sessions
+        WHERE status = 'active'
+        ORDER BY id DESC
+    """).fetchall()
+
+    transactions = conn.execute("""
+        SELECT *
+        FROM transactions
+        ORDER BY id DESC
+        LIMIT 50
+    """).fetchall()
+
+    coins = conn.execute("""
+        SELECT *
+        FROM coin_events
+        ORDER BY id DESC
+        LIMIT 50
+    """).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "sessions": [
+            {
+                "id": row["id"],
+                "kiosk_id": row["kiosk_id"],
+                "card_id": row["card_id"],
+                "mode": row["mode"],
+                "coin_count": row["coin_count"],
+                "amount": money(row["amount_cents"]),
+                "updated_at": row["updated_at"]
+            }
+            for row in sessions
+        ],
+        "transactions": [
+            {
+                "time": row["created_at"],
+                "kiosk": row["kiosk_id"],
+                "card": row["card_id"],
+                "type": row["type"],
+                "amount": money(row["amount_cents"]),
+                "coins": row["coins"],
+                "description": row["description"]
+            }
+            for row in transactions
+        ],
+        "coins": [
+            {
+                "time": row["created_at"],
+                "kiosk": row["kiosk_id"],
+                "card": row["card_id"] or "-",
+                "accepted": bool(row["accepted"]),
+                "coins": row["coins"],
+                "amount": money(row["amount_cents"]),
+                "reason": row["reason"]
+            }
+            for row in coins
+        ]
+    })
+
 
 KIOSK_HTML = r"""
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-
 <meta charset="UTF-8">
-
 <meta name="viewport"
       content="width=device-width,
                initial-scale=1.0,
                maximum-scale=1.0,
                user-scalable=no">
 
-<title>Service Kiosk</title>
+<title>Kiosk</title>
 
 <style>
-
 * {
     box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #071018;
+    color: white;
+    user-select: none;
 }
 
 body {
-    margin: 0;
-    background: #0e1014;
-    color: white;
-    font-family: Arial, Helvetica, sans-serif;
-    min-height: 100vh;
+    touch-action: manipulation;
 }
 
-.header {
-    height: 76px;
-    background: #171a20;
-    border-bottom: 1px solid #292d35;
-
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-
-    padding: 0 32px;
+#app {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background:
+        radial-gradient(circle at 50% 20%, #193449 0%, #071018 60%);
 }
 
-.logo {
-    font-size: 25px;
-    font-weight: 800;
+.video-background {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    opacity: 0.22;
+    z-index: 0;
 }
 
-.kiosk-id {
-    color: #8e96a3;
-    font-size: 14px;
+.video-background video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    filter: brightness(0.55) saturate(0.65);
 }
 
-.container {
-    width: min(1100px, 94%);
-    margin: 40px auto;
+.video-overlay {
+    position: absolute;
+    inset: 0;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(4, 11, 17, 0.35),
+            rgba(4, 11, 17, 0.9)
+        );
+}
+
+.animated-background {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.orb {
+    position: absolute;
+    width: 35vw;
+    height: 35vw;
+    border-radius: 50%;
+    filter: blur(70px);
+    opacity: 0.18;
+    animation: float 12s ease-in-out infinite alternate;
+}
+
+.orb.one {
+    left: -10%;
+    top: 5%;
+    background: #3d8fc4;
+}
+
+.orb.two {
+    right: -10%;
+    bottom: -5%;
+    background: #7558bd;
+    animation-delay: -5s;
+}
+
+@keyframes float {
+    from {
+        transform: translate3d(0, 0, 0);
+    }
+    to {
+        transform: translate3d(5vw, -4vh, 0);
+    }
 }
 
 .screen {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
     display: none;
+    flex-direction: column;
+    padding: 3vh 4vw;
+    animation: screenIn 0.25s ease;
 }
 
 .screen.active {
-    display: block;
+    display: flex;
+}
+
+@keyframes screenIn {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.topbar {
+    height: 9vh;
+    min-height: 55px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.logo {
+    font-size: clamp(22px, 3vw, 42px);
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+.language {
+    min-width: 125px;
+    height: 60px;
+    padding: 0 24px;
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 16px;
+    background: rgba(255,255,255,0.08);
+    color: white;
+    font-size: clamp(18px, 2vw, 28px);
+    font-weight: 600;
+}
+
+.language:active {
+    transform: scale(0.96);
+}
+
+.content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
 }
 
 .title {
-    font-size: 42px;
-    font-weight: 800;
-    margin-bottom: 8px;
+    font-size: clamp(30px, 5vw, 70px);
+    font-weight: 700;
+    text-align: center;
+    margin-bottom: 3vh;
 }
 
 .subtitle {
-    font-size: 19px;
-    color: #8f97a5;
-    margin-bottom: 35px;
+    font-size: clamp(18px, 2.4vw, 34px);
+    text-align: center;
+    opacity: 0.72;
+    margin-bottom: 4vh;
+    max-width: 850px;
+    line-height: 1.4;
 }
 
 .menu {
-    display: grid;
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 22px;
-}
-
-.menu-button {
-    min-height: 230px;
-
-    border: 1px solid #303641;
-    border-radius: 22px;
-
-    background: #181b22;
-    color: white;
-
-    cursor: pointer;
-
-    transition:
-        transform .15s,
-        background .15s;
-}
-
-.menu-button:hover {
-    transform: translateY(-4px);
-    background: #20242c;
-}
-
-.menu-icon {
-    font-size: 58px;
-    margin-bottom: 20px;
-}
-
-.menu-name {
-    font-size: 25px;
-    font-weight: 800;
-}
-
-.menu-description {
-    color: #8f97a5;
-    margin-top: 10px;
-    font-size: 15px;
-}
-
-.back {
-    border: none;
-    background: #252a33;
-    color: white;
-
-    padding: 13px 22px;
-    border-radius: 12px;
-
-    font-size: 16px;
-    cursor: pointer;
-
-    margin-bottom: 25px;
-}
-
-.back:hover {
-    background: #303641;
-}
-
-.scan-card {
-    width: min(700px, 100%);
-    margin: 50px auto;
-
-    text-align: center;
-
-    background: #181b22;
-    border: 1px solid #303641;
-    border-radius: 25px;
-
-    padding: 55px 30px;
-}
-
-.scan-icon {
-    font-size: 75px;
-    margin-bottom: 20px;
-}
-
-.scan-title {
-    font-size: 32px;
-    font-weight: 800;
-}
-
-.scan-description {
-    margin-top: 12px;
-    color: #8f97a5;
-    font-size: 18px;
-}
-
-.scanner-input {
-    position: absolute;
-    left: -9999px;
-    top: -9999px;
-
-    opacity: 0;
-}
-
-.card-box {
-    background: #181b22;
-    border: 1px solid #303641;
-    border-radius: 22px;
-
-    padding: 30px;
-}
-
-.card-id {
-    color: #8f97a5;
-    font-size: 15px;
-}
-
-.balance {
-    font-size: 58px;
-    font-weight: 900;
-    margin: 10px 0 25px;
-}
-
-.coin-panel {
-    display: grid;
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 15px;
-}
-
-.info {
-    background: #111318;
-    border-radius: 15px;
-    padding: 20px;
-}
-
-.info-label {
-    color: #8f97a5;
-    font-size: 14px;
-}
-
-.info-value {
-    font-size: 27px;
-    font-weight: 800;
-    margin-top: 7px;
-}
-
-.done {
-    width: 100%;
-    margin-top: 25px;
-
-    padding: 18px;
-
-    border: none;
-    border-radius: 14px;
-
-    background: #ffffff;
-    color: #111318;
-
-    font-size: 18px;
-    font-weight: 800;
-
-    cursor: pointer;
-}
-
-.done:hover {
-    background: #dddddd;
-}
-
-.products {
-    display: grid;
-    grid-template-columns:
-        repeat(3, 1fr);
-
+    width: min(900px, 92vw);
+    display: flex;
+    flex-direction: column;
     gap: 18px;
 }
 
-.product {
-    background: #181b22;
-    border: 1px solid #303641;
-
-    border-radius: 18px;
-    padding: 25px;
+.big-button {
+    width: 100%;
+    min-height: 100px;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 24px;
+    background: rgba(255,255,255,0.09);
+    color: white;
+    font-size: clamp(24px, 3.5vw, 46px);
+    font-weight: 650;
+    letter-spacing: 0.5px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+    transition:
+        transform 0.15s ease,
+        background 0.15s ease,
+        box-shadow 0.15s ease;
 }
 
-.product-name {
-    font-size: 22px;
-    font-weight: 800;
+.big-button:active {
+    transform: scale(0.975);
+    background: rgba(255,255,255,0.17);
+    box-shadow: 0 4px 15px rgba(0,0,0,0.25);
 }
 
-.product-price {
-    font-size: 30px;
-    font-weight: 900;
+.back-button {
+    width: min(330px, 85vw);
+    min-height: 82px;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 20px;
+    background: rgba(255,255,255,0.08);
+    color: white;
+    font-size: clamp(22px, 2.8vw, 38px);
+    font-weight: 600;
+}
 
+.back-button:active {
+    transform: scale(0.96);
+}
+
+.card-area {
+    width: min(700px, 92vw);
+    min-height: 190px;
+    border-radius: 30px;
+    border: 2px dashed rgba(255,255,255,0.28);
+    background: rgba(255,255,255,0.055);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    padding: 30px;
+    position: relative;
+    overflow: hidden;
+}
+
+.scan-line {
+    position: absolute;
+    left: 5%;
+    right: 5%;
+    height: 2px;
+    background: rgba(255,255,255,0.65);
+    box-shadow: 0 0 20px rgba(255,255,255,0.7);
+    animation: scan 2.2s ease-in-out infinite;
+}
+
+@keyframes scan {
+    0%, 100% {
+        top: 15%;
+        opacity: 0;
+    }
+    15% {
+        opacity: 1;
+    }
+    50% {
+        top: 85%;
+        opacity: 1;
+    }
+    85% {
+        opacity: 0;
+    }
+}
+
+.scan-text {
+    font-size: clamp(25px, 4vw, 48px);
+    font-weight: 600;
+    text-align: center;
+}
+
+.scan-input {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.amount {
+    font-size: clamp(55px, 10vw, 120px);
+    font-weight: 700;
+    letter-spacing: 2px;
     margin: 15px 0;
 }
 
-.buy {
-    width: 100%;
-
-    padding: 13px;
-
-    border: none;
-    border-radius: 10px;
-
-    background: white;
-    color: #111318;
-
-    font-weight: 800;
-    cursor: pointer;
+.card-number {
+    font-size: clamp(20px, 2.5vw, 34px);
+    opacity: 0.65;
+    word-break: break-all;
+    text-align: center;
 }
 
-.buy:disabled {
-    opacity: .35;
-    cursor: not-allowed;
+.info-box {
+    width: min(800px, 92vw);
+    padding: 30px;
+    border-radius: 28px;
+    background: rgba(255,255,255,0.075);
+    border: 1px solid rgba(255,255,255,0.12);
+    text-align: center;
+}
+
+.info-label {
+    font-size: clamp(18px, 2vw, 28px);
+    opacity: 0.65;
+}
+
+.info-value {
+    font-size: clamp(40px, 7vw, 80px);
+    font-weight: 700;
+    margin-top: 8px;
+}
+
+.charge-row {
+    display: flex;
+    width: min(900px, 92vw);
+    gap: 18px;
+    margin: 20px 0;
+}
+
+.charge-box {
+    flex: 1;
+    min-height: 130px;
+    padding: 25px;
+    border-radius: 24px;
+    background: rgba(255,255,255,0.07);
+    text-align: center;
+}
+
+.charge-label {
+    font-size: clamp(17px, 2vw, 27px);
+    opacity: 0.65;
+}
+
+.charge-value {
+    font-size: clamp(35px, 5vw, 60px);
+    font-weight: 700;
+    margin-top: 10px;
+}
+
+.product-grid {
+    width: min(1100px, 95vw);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 18px;
+    max-height: 55vh;
+    overflow-y: auto;
+    padding: 5px;
+}
+
+.product {
+    min-height: 210px;
+    border-radius: 25px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.075);
+    color: white;
+    padding: 25px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    text-align: center;
+}
+
+.product-name {
+    font-size: clamp(22px, 2.5vw, 34px);
+    font-weight: 650;
+}
+
+.product-price {
+    font-size: clamp(32px, 4vw, 50px);
+    font-weight: 700;
+}
+
+.product button {
+    width: 100%;
+    min-height: 65px;
+    border: 0;
+    border-radius: 17px;
+    background: rgba(255,255,255,0.14);
+    color: white;
+    font-size: 23px;
+    font-weight: 600;
+}
+
+.product button:active {
+    transform: scale(0.96);
+}
+
+.warning {
+    width: min(850px, 92vw);
+    padding: 35px;
+    border-radius: 28px;
+    background: rgba(255,170,0,0.09);
+    border: 1px solid rgba(255,190,50,0.35);
+    text-align: center;
+}
+
+.warning-title {
+    font-size: clamp(28px, 4vw, 48px);
+    font-weight: 700;
+    margin-bottom: 20px;
+}
+
+.warning-text {
+    font-size: clamp(19px, 2.3vw, 30px);
+    line-height: 1.5;
+    opacity: 0.85;
+}
+
+.button-row {
+    display: flex;
+    width: min(850px, 92vw);
+    gap: 18px;
+    margin-top: 30px;
+}
+
+.action-button {
+    flex: 1;
+    min-height: 85px;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 20px;
+    background: rgba(255,255,255,0.09);
+    color: white;
+    font-size: clamp(21px, 2.6vw, 34px);
+    font-weight: 650;
+}
+
+.action-button:active {
+    transform: scale(0.97);
+}
+
+.success {
+    animation: successPulse 1.3s ease-in-out infinite alternate;
+}
+
+@keyframes successPulse {
+    from {
+        transform: scale(1);
+    }
+    to {
+        transform: scale(1.025);
+    }
+}
+
+.countdown {
+    margin-top: 25px;
+    font-size: clamp(18px, 2.2vw, 28px);
+    opacity: 0.6;
 }
 
 .status {
-    position: fixed;
-
-    left: 50%;
-    bottom: 25px;
-
-    transform: translateX(-50%);
-
-    padding: 14px 25px;
-
-    background: #242932;
-    border: 1px solid #383e49;
-
-    border-radius: 14px;
-
-    display: none;
-
-    z-index: 100;
+    position: absolute;
+    left: 25px;
+    bottom: 20px;
+    z-index: 5;
+    font-size: 16px;
+    opacity: 0.5;
 }
 
-.status.show {
-    display: block;
-}
+@media (max-width: 600px) {
+    .screen {
+        padding: 2vh 4vw;
+    }
 
-.status.error {
-    background: #4b1f25;
-}
+    .topbar {
+        height: 8vh;
+    }
 
-.status.success {
-    background: #1e4931;
-}
+    .logo {
+        font-size: 22px;
+    }
 
-@media(max-width: 750px) {
+    .language {
+        min-width: 90px;
+        height: 50px;
+        padding: 0 14px;
+        font-size: 17px;
+    }
 
-    .menu {
+    .big-button {
+        min-height: 85px;
+        border-radius: 20px;
+    }
+
+    .charge-row {
+        flex-direction: column;
+    }
+
+    .charge-box {
+        min-height: 100px;
+    }
+
+    .button-row {
+        flex-direction: column;
+    }
+
+    .action-button {
+        min-height: 75px;
+    }
+
+    .product-grid {
         grid-template-columns: 1fr;
+        max-height: 48vh;
     }
-
-    .menu-button {
-        min-height: 150px;
-    }
-
-    .coin-panel {
-        grid-template-columns: 1fr;
-    }
-
-    .products {
-        grid-template-columns: 1fr;
-    }
-
-    .title {
-        font-size: 32px;
-    }
-
 }
-
 </style>
-
 </head>
 
 <body>
 
-<header class="header">
+<div id="app">
 
-    <div class="logo">
-        SERVICE KIOSK
+    <div class="video-background">
+        <video id="backgroundVideo"
+               autoplay
+               muted
+               loop
+               playsinline></video>
+
+        <div class="video-overlay"></div>
     </div>
 
-    <div class="kiosk-id">
-        {{ kiosk_id }}
+    <div class="animated-background">
+        <div class="orb one"></div>
+        <div class="orb two"></div>
     </div>
 
-</header>
+    <input
+        id="scanner"
+        class="scan-input"
+        type="text"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        spellcheck="false"
+    >
 
+    <div class="screen active" id="homeScreen">
 
-<div class="container">
-
-    <!-- HOME -->
-
-    <section id="home" class="screen active">
-
-        <div class="title">
-            What would you like to do?
+        <div class="topbar">
+            <div class="logo">KIOSK</div>
+            <button class="language" onclick="toggleLanguage()">
+                <span id="languageButton">中文</span>
+            </button>
         </div>
 
-        <div class="subtitle">
-            Select a service below.
+        <div class="content">
+
+            <div class="title" id="homeTitle">
+                Welcome
+            </div>
+
+            <div class="subtitle" id="homeSubtitle">
+                Please select a service
+            </div>
+
+            <div class="menu">
+
+                <button class="big-button" onclick="startMode('charge')">
+                    <span data-en="Charge Card"
+                          data-zh="充值卡">
+                        Charge Card
+                    </span>
+                </button>
+
+                <button class="big-button" onclick="startMode('balance')">
+                    <span data-en="Check Balance"
+                          data-zh="查询余额">
+                        Check Balance
+                    </span>
+                </button>
+
+                <button class="big-button" onclick="startMode('store')">
+                    <span data-en="Store"
+                          data-zh="商店">
+                        Store
+                    </span>
+                </button>
+
+            </div>
+
         </div>
 
-        <div class="menu">
+    </div>
 
-            <button
-                class="menu-button"
-                onclick="startMode('charge')">
 
-                <div class="menu-icon">
-                    💳
+    <div class="screen" id="scanScreen">
+
+        <div class="topbar">
+            <div class="logo" id="scanModeTitle">
+                Scan Card
+            </div>
+
+            <button class="language" onclick="toggleLanguage()">
+                <span id="languageButton2">中文</span>
+            </button>
+        </div>
+
+        <div class="content">
+
+            <div class="title" id="scanTitle">
+                Please scan your card
+            </div>
+
+            <div class="subtitle" id="scanSubtitle">
+                Use the card reader to continue
+            </div>
+
+            <div class="card-area"
+                 onclick="focusScanner()">
+
+                <div class="scan-line"></div>
+
+                <div class="scan-text" id="scanText">
+                    Waiting for card
                 </div>
 
-                <div class="menu-name">
+            </div>
+
+            <div class="countdown" id="scanCountdown"></div>
+
+            <button class="back-button"
+                    onclick="goBack()"
+                    style="margin-top:30px">
+
+                <span data-en="Back"
+                      data-zh="返回">
+                    Back
+                </span>
+
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <div class="screen" id="chargeScreen">
+
+        <div class="topbar">
+
+            <div class="logo">
+                <span data-en="Charge Card"
+                      data-zh="充值卡">
                     Charge Card
-                </div>
+                </span>
+            </div>
 
-                <div class="menu-description">
-                    Add money to your card
-                </div>
-
-            </button>
-
-
-            <button
-                class="menu-button"
-                onclick="startMode('balance')">
-
-                <div class="menu-icon">
-                    💰
-                </div>
-
-                <div class="menu-name">
-                    Check Balance
-                </div>
-
-                <div class="menu-description">
-                    View your card balance
-                </div>
-
-            </button>
-
-
-            <button
-                class="menu-button"
-                onclick="startMode('store')">
-
-                <div class="menu-icon">
-                    🛒
-                </div>
-
-                <div class="menu-name">
-                    Store
-                </div>
-
-                <div class="menu-description">
-                    Purchase available services
-                </div>
-
+            <button class="language" onclick="toggleLanguage()">
+                <span id="languageButton3">中文</span>
             </button>
 
         </div>
 
-    </section>
+        <div class="content">
 
-
-    <!-- SCAN -->
-
-    <section id="scan" class="screen">
-
-        <button class="back"
-                onclick="goHome()">
-            ← Back
-        </button>
-
-        <div class="scan-card">
-
-            <div class="scan-icon">
-                💳
+            <div class="subtitle" id="chargeCardText">
+                Card
             </div>
 
-            <div class="scan-title">
-                Scan your card
-            </div>
+            <div class="card-number" id="chargeCardId"></div>
 
-            <div class="scan-description">
-                Place your card on the card reader.
-            </div>
+            <div class="charge-row">
 
-            <input
-                id="scannerInput"
-                class="scanner-input"
-                autocomplete="off"
-                autofocus>
+                <div class="charge-box">
 
-        </div>
-
-    </section>
-
-
-    <!-- CHARGE -->
-
-    <section id="charge" class="screen">
-
-        <button class="back"
-                onclick="goHome()">
-            ← Back
-        </button>
-
-        <div class="title">
-            Charge Card
-        </div>
-
-        <div class="subtitle">
-            Insert coins to add money to this card.
-        </div>
-
-        <div class="card-box">
-
-            <div class="card-id">
-                Card: <span id="chargeCardId">---</span>
-            </div>
-
-            <div
-                class="balance"
-                id="chargeBalance">
-                $0.00
-            </div>
-
-            <div class="coin-panel">
-
-                <div class="info">
-
-                    <div class="info-label">
-                        Coins inserted
+                    <div class="charge-label"
+                         data-en="Amount"
+                         data-zh="充值金额">
+                        Amount
                     </div>
 
-                    <div
-                        class="info-value"
-                        id="coinCount">
+                    <div class="charge-value"
+                         id="chargeAmount">
+                        $0.00
+                    </div>
+
+                </div>
+
+                <div class="charge-box">
+
+                    <div class="charge-label"
+                         data-en="Coins"
+                         data-zh="硬币数量">
+                        Coins
+                    </div>
+
+                    <div class="charge-value"
+                         id="chargeCoins">
                         0
                     </div>
 
                 </div>
 
+            </div>
 
-                <div class="info">
+            <div class="info-box">
 
-                    <div class="info-label">
-                        Added
-                    </div>
-
-                    <div
-                        class="info-value"
-                        id="coinAmount">
-                        $0.00
-                    </div>
-
+                <div class="info-label"
+                     data-en="Current Balance"
+                     data-zh="当前余额">
+                    Current Balance
                 </div>
 
-
-                <div class="info">
-
-                    <div class="info-label">
-                        New balance
-                    </div>
-
-                    <div
-                        class="info-value"
-                        id="newBalance">
-                        $0.00
-                    </div>
-
+                <div class="info-value"
+                     id="chargeBalance">
+                    $0.00
                 </div>
 
             </div>
 
+            <div class="subtitle"
+                 id="chargeInstruction"
+                 style="margin-top:25px">
+                Insert coins
+            </div>
 
-            <button
-                class="done"
-                onclick="finishSession()">
+            <button class="back-button"
+                    onclick="cancelCharge()">
 
-                FINISHED
+                <span data-en="Back"
+                      data-zh="返回">
+                    Back
+                </span>
 
             </button>
 
         </div>
 
-    </section>
+    </div>
 
 
-    <!-- BALANCE -->
+    <div class="screen" id="confirmCardScreen">
 
-    <section id="balance" class="screen">
-
-        <button class="back"
-                onclick="goHome()">
-            ← Back
-        </button>
-
-        <div class="title">
-            Card Balance
+        <div class="topbar">
+            <div class="logo">
+                <span data-en="Update Card"
+                      data-zh="更新卡片">
+                    Update Card
+                </span>
+            </div>
         </div>
 
-        <div class="subtitle">
-            Current balance
-        </div>
+        <div class="content">
 
-        <div class="card-box">
-
-            <div class="card-id">
-                Card: <span id="balanceCardId">---</span>
+            <div class="title"
+                 data-en="Tap your card again"
+                 data-zh="请再次刷卡">
+                Tap your card again
             </div>
 
-            <div
-                class="balance"
-                id="balanceAmount">
+            <div class="subtitle"
+                 data-en="The amount will be added to your card after it is confirmed."
+                 data-zh="确认卡片后，充值金额将加入您的卡中。">
+                The amount will be added to your card after it is confirmed.
+            </div>
+
+            <div class="card-area"
+                 onclick="focusScanner()">
+
+                <div class="scan-line"></div>
+
+                <div class="scan-text"
+                     data-en="Tap card"
+                     data-zh="请刷卡">
+                    Tap card
+                </div>
+
+            </div>
+
+            <div class="countdown" id="confirmCountdown"></div>
+
+        </div>
+
+    </div>
+
+
+    <div class="screen" id="differentCardScreen">
+
+        <div class="topbar">
+            <div class="logo">
+                <span data-en="Card Warning"
+                      data-zh="卡片警告">
+                    Card Warning
+                </span>
+            </div>
+        </div>
+
+        <div class="content">
+
+            <div class="warning">
+
+                <div class="warning-title"
+                     data-en="Different card detected"
+                     data-zh="检测到不同的卡">
+                    Different card detected
+                </div>
+
+                <div class="warning-text">
+
+                    <div>
+                        <span data-en="Original card:"
+                              data-zh="原卡：">
+                            Original card:
+                        </span>
+
+                        <br>
+
+                        <strong id="originalCard"></strong>
+                    </div>
+
+                    <br>
+
+                    <div>
+                        <span data-en="Card scanned:"
+                              data-zh="扫描的卡：">
+                            Card scanned:
+                        </span>
+
+                        <br>
+
+                        <strong id="differentCard"></strong>
+                    </div>
+
+                    <br>
+
+                    <span data-en="Do you want to continue with this card?"
+                          data-zh="是否要使用这张卡继续？">
+                        Do you want to continue with this card?
+                    </span>
+
+                </div>
+
+            </div>
+
+            <div class="button-row">
+
+                <button class="action-button"
+                        onclick="continueDifferentCard()">
+
+                    <span data-en="Continue"
+                          data-zh="继续">
+                        Continue
+                    </span>
+
+                </button>
+
+                <button class="action-button"
+                        onclick="goBack()">
+
+                    <span data-en="Back"
+                          data-zh="返回">
+                        Back
+                    </span>
+
+                </button>
+
+            </div>
+
+            <div class="countdown"
+                 id="differentCountdown"></div>
+
+        </div>
+
+    </div>
+
+
+    <div class="screen" id="balanceScreen">
+
+        <div class="topbar">
+            <div class="logo">
+                <span data-en="Balance"
+                      data-zh="余额">
+                    Balance
+                </span>
+            </div>
+        </div>
+
+        <div class="content">
+
+            <div class="subtitle"
+                 data-en="Card balance"
+                 data-zh="卡片余额">
+                Card balance
+            </div>
+
+            <div class="amount"
+                 id="balanceAmount">
                 $0.00
             </div>
 
+            <div class="card-number"
+                 id="balanceCard">
+            </div>
+
+            <div class="countdown"
+                 id="balanceCountdown">
+            </div>
+
         </div>
 
-    </section>
+    </div>
 
 
-    <!-- STORE -->
+    <div class="screen" id="storeScreen">
 
-    <section id="store" class="screen">
+        <div class="topbar">
 
-        <button class="back"
-                onclick="goHome()">
-            ← Back
-        </button>
+            <div class="logo">
+                <span data-en="Store"
+                      data-zh="商店">
+                    Store
+                </span>
+            </div>
 
-        <div class="title">
-            Store
         </div>
 
-        <div class="subtitle">
+        <div class="content">
 
-            Balance:
-            <strong id="storeBalance">
+            <div class="subtitle">
+
+                <span data-en="Available Balance"
+                      data-zh="可用余额">
+                    Available Balance
+                </span>
+
+            </div>
+
+            <div class="amount"
+                 id="storeBalance">
                 $0.00
-            </strong>
+            </div>
+
+            <div class="product-grid"
+                 id="products">
+            </div>
+
+            <button class="back-button"
+                    onclick="goBack()"
+                    style="margin-top:20px">
+
+                <span data-en="Back"
+                      data-zh="返回">
+                    Back
+                </span>
+
+            </button>
 
         </div>
 
-        <div
-            id="products"
-            class="products">
+    </div>
+
+
+    <div class="screen" id="successScreen">
+
+        <div class="content">
+
+            <div class="title success"
+                 id="successTitle">
+                Complete
+            </div>
+
+            <div class="subtitle"
+                 id="successMessage">
+            </div>
+
+            <div class="amount"
+                 id="successAmount">
+            </div>
+
+            <div class="subtitle"
+                 id="successBalance">
+            </div>
+
+            <div class="countdown"
+                 id="successCountdown">
+            </div>
+
         </div>
 
-    </section>
-
-</div>
+    </div>
 
 
-<div id="status"
-     class="status">
+    <div class="screen" id="errorScreen">
+
+        <div class="content">
+
+            <div class="title"
+                 data-en="Unable to continue"
+                 data-zh="无法继续">
+                Unable to continue
+            </div>
+
+            <div class="subtitle"
+                 id="errorMessage">
+            </div>
+
+            <button class="back-button"
+                    onclick="goHome()">
+
+                <span data-en="Back"
+                      data-zh="返回">
+                    Back
+                </span>
+
+            </button>
+
+        </div>
+
+    </div>
+
+    <div class="status" id="status">
+        ● READY
+    </div>
+
 </div>
 
 
 <script>
+const KIOSK_ID = "{{ KIOSK_ID }}";
 
-const kioskId = {{ kiosk_id|tojson }};
+const videos = {{ videos | tojson }};
 
+let language = "en";
 let currentMode = null;
 let currentCard = null;
+let pendingDifferentCard = null;
 
-let scannerTimer = null;
+let screenTimer = null;
+let chargeTimer = null;
+let countdownTimer = null;
+
+const scanner = document.getElementById("scanner");
+const video = document.getElementById("backgroundVideo");
 
 
-function showScreen(name) {
+function setLanguageText() {
 
-    document
-        .querySelectorAll(".screen")
-        .forEach(screen => {
-            screen.classList.remove("active");
-        });
+    document.querySelectorAll("[data-en]").forEach(element => {
 
-    document
-        .getElementById(name)
-        .classList.add("active");
+        element.textContent =
+            language === "en"
+            ? element.dataset.en
+            : element.dataset.zh;
+
+    });
+
+    const languageText =
+        language === "en"
+        ? "中文"
+        : "English";
+
+    document.querySelectorAll(
+        "#languageButton, #languageButton2, #languageButton3"
+    ).forEach(element => {
+        element.textContent = languageText;
+    });
+
+    document.documentElement.lang =
+        language === "en" ? "en" : "zh-CN";
 }
 
 
-function showStatus(message, type="") {
+function toggleLanguage() {
+    language = language === "en" ? "zh" : "en";
+    setLanguageText();
+}
 
-    const box = document.getElementById("status");
 
-    box.innerText = message;
+function showScreen(id) {
 
-    box.className = "status show " + type;
+    document.querySelectorAll(".screen").forEach(screen => {
+        screen.classList.remove("active");
+    });
 
-    setTimeout(() => {
-        box.className = "status";
-    }, 3000);
+    document.getElementById(id).classList.add("active");
+
+    clearTimeout(screenTimer);
+    clearInterval(countdownTimer);
+
+    setLanguageText();
 }
 
 
 function focusScanner() {
 
-    const input =
-        document.getElementById("scannerInput");
-
-    input.value = "";
-
-    input.focus();
-
-}
-
-
-function startMode(mode) {
-
-    currentMode = mode;
-    currentCard = null;
-
-    showScreen("scan");
+    scanner.value = "";
 
     setTimeout(() => {
-        focusScanner();
-    }, 100);
-
+        scanner.focus();
+    }, 50);
 }
 
 
-function goHome() {
+function keepScannerFocused() {
 
-    fetch("/api/kiosk/end", {
-        method: "POST",
+    const scanScreens = [
+        "scanScreen",
+        "confirmCardScreen"
+    ];
 
-        headers: {
-            "Content-Type": "application/json"
-        },
+    const active = document.querySelector(".screen.active");
 
-        body: JSON.stringify({
-            kiosk_id: kioskId
-        })
-    }).catch(() => {});
-
-    currentMode = null;
-    currentCard = null;
-
-    showScreen("home");
-
+    if (
+        active &&
+        scanScreens.includes(active.id)
+    ) {
+        if (document.activeElement !== scanner) {
+            scanner.focus();
+        }
+    }
 }
 
 
-async function scanCard(cardId) {
+setInterval(keepScannerFocused, 300);
 
-    cardId = cardId.trim();
+
+scanner.addEventListener("keydown", async event => {
+
+    if (event.key !== "Enter") {
+        return;
+    }
+
+    event.preventDefault();
+
+    const cardId = scanner.value.trim();
 
     if (!cardId) {
         return;
     }
 
+    scanner.value = "";
+
+    await handleCardScan(cardId);
+});
+
+
+function startMode(mode) {
+
+    currentMode = mode;
+
+    if (mode === "charge") {
+        document.getElementById("scanModeTitle").textContent =
+            language === "en" ? "Charge Card" : "充值卡";
+    }
+
+    if (mode === "balance") {
+        document.getElementById("scanModeTitle").textContent =
+            language === "en" ? "Check Balance" : "查询余额";
+    }
+
+    if (mode === "store") {
+        document.getElementById("scanModeTitle").textContent =
+            language === "en" ? "Store" : "商店";
+    }
+
+    document.getElementById("scanTitle").textContent =
+        language === "en"
+        ? "Please scan your card"
+        : "请扫描您的卡";
+
+    document.getElementById("scanSubtitle").textContent =
+        language === "en"
+        ? "Use the card reader to continue"
+        : "请使用读卡器继续";
+
+    document.getElementById("scanText").textContent =
+        language === "en"
+        ? "Waiting for card"
+        : "等待刷卡";
+
+    showScreen("scanScreen");
+
+    focusScanner();
+
+    startCountdown(
+        30,
+        "scanCountdown",
+        () => goHome()
+    );
+}
+
+
+async function handleCardScan(cardId) {
+
+    clearInterval(countdownTimer);
+
+    currentCard = cardId;
+
     try {
 
-        const response =
-            await fetch("/api/kiosk/scan", {
+        const response = await fetch("/api/kiosk/scan", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                kiosk_id: KIOSK_ID,
+                card_id: cardId,
+                mode: currentMode
+            })
+        });
 
-                method: "POST",
+        const data = await response.json();
 
-                headers: {
-                    "Content-Type": "application/json"
-                },
+        if (!data.success) {
+            showError(data.message || "Unable to scan card");
+            return;
+        }
 
-                body: JSON.stringify({
-                    kiosk_id: kioskId,
-                    card_id: cardId,
-                    mode: currentMode
-                })
+        if (currentMode === "charge") {
 
-            });
+            document.getElementById("chargeCardId")
+                .textContent = data.card_id;
 
-        const data =
-            await response.json();
+            document.getElementById("chargeAmount")
+                .textContent = "$0.00";
 
-        if (!response.ok) {
+            document.getElementById("chargeCoins")
+                .textContent = "0";
 
-            showStatus(
-                data.error || "Card could not be scanned.",
-                "error"
-            );
+            document.getElementById("chargeBalance")
+                .textContent = data.balance;
 
-            focusScanner();
+            showScreen("chargeScreen");
+
+            startChargePolling();
 
             return;
         }
 
-        currentCard = cardId;
+        if (currentMode === "balance") {
 
-        if (currentMode === "charge") {
+            document.getElementById("balanceAmount")
+                .textContent = data.balance;
 
-            document
-                .getElementById("chargeCardId")
-                .innerText = cardId;
+            document.getElementById("balanceCard")
+                .textContent = data.card_id;
 
-            updateCharge(data);
+            showScreen("balanceScreen");
 
-            showScreen("charge");
+            startCountdown(
+                10,
+                "balanceCountdown",
+                () => goHome()
+            );
 
+            return;
         }
 
-        else if (currentMode === "balance") {
+        if (currentMode === "store") {
 
-            document
-                .getElementById("balanceCardId")
-                .innerText = cardId;
+            document.getElementById("storeBalance")
+                .textContent = data.balance;
 
-            document
-                .getElementById("balanceAmount")
-                .innerText =
-                data.balance;
+            await loadProducts();
 
-            showScreen("balance");
+            showScreen("storeScreen");
 
-        }
-
-        else if (currentMode === "store") {
-
-            updateStore(data);
-
-            showScreen("store");
-
+            return;
         }
 
     } catch (error) {
 
-        showStatus(
-            "Could not connect to the service.",
-            "error"
+        showError(
+            language === "en"
+            ? "Unable to connect to the server."
+            : "无法连接到服务器。"
         );
+    }
+}
+
+
+function startChargePolling() {
+
+    clearInterval(chargeTimer);
+
+    chargeTimer = setInterval(async () => {
+
+        try {
+
+            const response = await fetch(
+                "/api/kiosk/state?kiosk_id=" +
+                encodeURIComponent(KIOSK_ID)
+            );
+
+            const data = await response.json();
+
+            if (!data.active) {
+                clearInterval(chargeTimer);
+                return;
+            }
+
+            document.getElementById("chargeAmount")
+                .textContent = data.amount;
+
+            document.getElementById("chargeCoins")
+                .textContent = data.coin_count;
+
+            document.getElementById("chargeBalance")
+                .textContent = data.balance;
+
+            if (data.amount_cents > 0) {
+
+                document.getElementById("chargeInstruction")
+                    .textContent =
+                    language === "en"
+                    ? "Tap your card again to update it"
+                    : "请再次刷卡以更新余额";
+            }
+
+        } catch (error) {
+        }
+
+    }, 500);
+}
+
+
+async function cancelCharge() {
+
+    clearInterval(chargeTimer);
+
+    try {
+
+        await fetch("/api/kiosk/end", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                kiosk_id: KIOSK_ID
+            })
+        });
+
+    } catch (error) {
+    }
+
+    goHome();
+}
+
+
+async function finishCharge() {
+
+    clearInterval(chargeTimer);
+
+    try {
+
+        const response = await fetch(
+            "/api/kiosk/state?kiosk_id=" +
+            encodeURIComponent(KIOSK_ID)
+        );
+
+        const state = await response.json();
+
+        if (!state.active) {
+            showError(
+                language === "en"
+                ? "The charge session has ended."
+                : "充值会话已结束。"
+            );
+            return;
+        }
+
+        if (state.amount_cents <= 0) {
+            showError(
+                language === "en"
+                ? "Please insert coins first."
+                : "请先投入硬币。"
+            );
+            return;
+        }
+
+        showScreen("confirmCardScreen");
 
         focusScanner();
 
-    }
+        startCountdown(
+            30,
+            "confirmCountdown",
+            () => cancelCharge()
+        );
 
+    } catch (error) {
+
+        showError(
+            language === "en"
+            ? "Unable to continue."
+            : "无法继续。"
+        );
+    }
 }
 
 
-document
-    .getElementById("scannerInput")
-    .addEventListener("keydown", function(event) {
+async function confirmCard(cardId) {
 
-        if (event.key === "Enter") {
+    try {
 
-            event.preventDefault();
+        const response = await fetch(
+            "/api/kiosk/confirm-charge",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    kiosk_id: KIOSK_ID,
+                    card_id: cardId
+                })
+            }
+        );
 
-            const card =
-                this.value.trim();
+        const data = await response.json();
 
-            this.value = "";
+        if (data.success) {
 
-            scanCard(card);
+            showSuccess(
+                language === "en"
+                ? "Card updated successfully"
+                : "卡片更新成功",
+                data.added,
+                language === "en"
+                ? "New balance: " + data.balance
+                : "新余额：" + data.balance
+            );
 
+            return;
         }
 
-    });
+        if (data.different_card) {
 
+            pendingDifferentCard = data.scanned_card;
 
-function updateCharge(data) {
+            document.getElementById("originalCard")
+                .textContent = data.original_card;
 
-    document
-        .getElementById("chargeBalance")
-        .innerText = data.balance;
+            document.getElementById("differentCard")
+                .textContent = data.scanned_card;
 
-    document
-        .getElementById("coinCount")
-        .innerText = data.coin_count;
+            showScreen("differentCardScreen");
 
-    document
-        .getElementById("coinAmount")
-        .innerText = data.added;
+            startCountdown(
+                20,
+                "differentCountdown",
+                () => cancelCharge()
+            );
 
-    document
-        .getElementById("newBalance")
-        .innerText = data.balance;
+            return;
+        }
 
+        showError(data.message || "Unable to update card");
+
+    } catch (error) {
+
+        showError(
+            language === "en"
+            ? "Unable to connect to the server."
+            : "无法连接到服务器。"
+        );
+    }
 }
 
 
-function updateStore(data) {
+async function continueDifferentCard() {
 
-    document
-        .getElementById("storeBalance")
-        .innerText = data.balance;
+    if (!pendingDifferentCard) {
+        return;
+    }
+
+    showScreen("confirmCardScreen");
+
+    document.querySelector("#confirmCardScreen .title")
+        .textContent =
+        language === "en"
+        ? "Tap the new card again"
+        : "请再次刷新的卡";
+
+    document.querySelector("#confirmCardScreen .subtitle")
+        .textContent =
+        language === "en"
+        ? "Tap the same card again to confirm."
+        : "请再次刷同一张卡以确认。";
+
+    focusScanner();
+
+    startCountdown(
+        30,
+        "confirmCountdown",
+        () => cancelCharge()
+    );
+
+    currentMode = "different-confirm";
+}
+
+
+async function handleDifferentCardConfirmation(cardId) {
+
+    if (cardId !== pendingDifferentCard) {
+
+        document.getElementById("originalCard")
+            .textContent = pendingDifferentCard;
+
+        document.getElementById("differentCard")
+            .textContent = cardId;
+
+        showScreen("differentCardScreen");
+
+        startCountdown(
+            20,
+            "differentCountdown",
+            () => cancelCharge()
+        );
+
+        return;
+    }
+
+    try {
+
+        const response = await fetch(
+            "/api/kiosk/confirm-different-card",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    kiosk_id: KIOSK_ID,
+                    card_id: cardId
+                })
+            }
+        );
+
+        const data = await response.json();
+
+        if (!data.success) {
+
+            showError(data.message || "Unable to update card");
+            return;
+        }
+
+        showSuccess(
+            language === "en"
+            ? "Card updated successfully"
+            : "卡片更新成功",
+            data.added,
+            language === "en"
+            ? "New balance: " + data.balance
+            : "新余额：" + data.balance
+        );
+
+    } catch (error) {
+
+        showError(
+            language === "en"
+            ? "Unable to connect to the server."
+            : "无法连接到服务器。"
+        );
+    }
+}
+
+
+async function loadProducts() {
 
     const container =
         document.getElementById("products");
 
     container.innerHTML = "";
 
-    data.products.forEach(product => {
+    try {
 
-        const item =
-            document.createElement("div");
+        const response =
+            await fetch("/api/store/products");
 
-        item.className = "product";
+        const products =
+            await response.json();
 
-        item.innerHTML = `
+        products.forEach(product => {
 
-            <div class="product-name">
-                ${escapeHtml(product.name)}
-            </div>
+            const card =
+                document.createElement("div");
 
-            <div class="product-price">
-                ${product.price}
-            </div>
+            card.className = "product";
 
-            <button
-                class="buy"
-                ${product.price_cents > data.balance_cents ? "disabled" : ""}
-                onclick="buyProduct(${product.id})">
+            card.innerHTML = `
+                <div class="product-name">
+                    ${escapeHtml(product.name)}
+                </div>
 
-                ${product.price_cents > data.balance_cents
-                    ? "Insufficient Balance"
-                    : "Purchase"}
+                <div class="product-price">
+                    ${product.price}
+                </div>
 
-            </button>
+                <button>
+                    ${language === "en" ? "BUY" : "购买"}
+                </button>
+            `;
 
-        `;
+            card.querySelector("button")
+                .addEventListener(
+                    "click",
+                    () => buyProduct(product.id)
+                );
 
-        container.appendChild(item);
+            container.appendChild(card);
+        });
 
-    });
+    } catch (error) {
 
+        container.innerHTML =
+            `<div class="subtitle">
+                ${
+                    language === "en"
+                    ? "Unable to load products."
+                    : "无法加载商品。"
+                }
+            </div>`;
+    }
 }
 
 
 async function buyProduct(productId) {
 
+    const buttons =
+        document.querySelectorAll(".product button");
+
+    buttons.forEach(button => {
+        button.disabled = true;
+    });
+
     try {
 
         const response =
             await fetch("/api/store/buy", {
-
                 method: "POST",
-
                 headers: {
                     "Content-Type": "application/json"
                 },
-
                 body: JSON.stringify({
-
-                    kiosk_id: kioskId,
-
+                    kiosk_id: KIOSK_ID,
                     card_id: currentCard,
-
                     product_id: productId
-
                 })
-
             });
 
         const data =
             await response.json();
 
-        if (!response.ok) {
+        buttons.forEach(button => {
+            button.disabled = false;
+        });
 
-            showStatus(
-                data.error || "Purchase failed.",
-                "error"
+        if (data.success) {
+
+            document.getElementById("storeBalance")
+                .textContent = data.balance;
+
+            showSuccess(
+                language === "en"
+                ? "Purchase complete"
+                : "购买完成",
+                data.price,
+                language === "en"
+                ? "Remaining balance: " + data.balance
+                : "剩余余额：" + data.balance
             );
 
             return;
         }
 
-        updateStore(data);
+        if (data.insufficient) {
 
-        showStatus(
-            "Purchase successful.",
-            "success"
+            showError(
+                language === "en"
+                ? "Insufficient balance. You have " +
+                  data.balance +
+                  " but need " +
+                  data.required + "."
+                : "余额不足。当前余额 " +
+                  data.balance +
+                  "，需要 " +
+                  data.required + "。"
+            );
+
+            return;
+        }
+
+        showError(data.message || "Purchase failed");
+
+    } catch (error) {
+
+        buttons.forEach(button => {
+            button.disabled = false;
+        });
+
+        showError(
+            language === "en"
+            ? "Unable to connect to the server."
+            : "无法连接到服务器。"
         );
-
-    } catch {
-
-        showStatus(
-            "Could not complete purchase.",
-            "error"
-        );
-
     }
-
 }
 
 
-async function finishSession() {
+async function handleCardScan(cardId) {
 
-    await fetch("/api/kiosk/end", {
+    if (currentMode === "different-confirm") {
+        await handleDifferentCardConfirmation(cardId);
+        return;
+    }
 
+    if (currentMode === "charge") {
+
+        const active =
+            document.getElementById("chargeScreen")
+                .classList.contains("active");
+
+        if (active) {
+            await finishCharge();
+            return;
+        }
+
+        await confirmCard(cardId);
+        return;
+    }
+
+    await originalCardScan(cardId);
+}
+
+
+async function originalCardScan(cardId) {
+
+    currentCard = cardId;
+
+    try {
+
+        const response = await fetch("/api/kiosk/scan", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                kiosk_id: KIOSK_ID,
+                card_id: cardId,
+                mode: currentMode
+            })
+        });
+
+        const data = await response.json();
+
+        if (!data.success) {
+            showError(data.message || "Unable to scan card");
+            return;
+        }
+
+        if (currentMode === "charge") {
+
+            document.getElementById("chargeCardId")
+                .textContent = data.card_id;
+
+            document.getElementById("chargeAmount")
+                .textContent = "$0.00";
+
+            document.getElementById("chargeCoins")
+                .textContent = "0";
+
+            document.getElementById("chargeBalance")
+                .textContent = data.balance;
+
+            showScreen("chargeScreen");
+
+            startChargePolling();
+
+        } else if (currentMode === "balance") {
+
+            document.getElementById("balanceAmount")
+                .textContent = data.balance;
+
+            document.getElementById("balanceCard")
+                .textContent = data.card_id;
+
+            showScreen("balanceScreen");
+
+            startCountdown(
+                10,
+                "balanceCountdown",
+                () => goHome()
+            );
+
+        } else if (currentMode === "store") {
+
+            document.getElementById("storeBalance")
+                .textContent = data.balance;
+
+            await loadProducts();
+
+            showScreen("storeScreen");
+        }
+
+    } catch (error) {
+
+        showError(
+            language === "en"
+            ? "Unable to connect to the server."
+            : "无法连接到服务器。"
+        );
+    }
+}
+
+
+function startCountdown(seconds, elementId, callback) {
+
+    clearInterval(countdownTimer);
+
+    let remaining = seconds;
+
+    const element =
+        document.getElementById(elementId);
+
+    function update() {
+
+        if (!element) {
+            return;
+        }
+
+        element.textContent =
+            language === "en"
+            ? "Returning in " + remaining + " seconds"
+            : remaining + " 秒后返回";
+
+        remaining--;
+
+        if (remaining < 0) {
+
+            clearInterval(countdownTimer);
+
+            if (callback) {
+                callback();
+            }
+        }
+    }
+
+    update();
+
+    countdownTimer =
+        setInterval(update, 1000);
+}
+
+
+function showSuccess(title, amount, message) {
+
+    clearInterval(chargeTimer);
+
+    document.getElementById("successTitle")
+        .textContent = title;
+
+    document.getElementById("successAmount")
+        .textContent = amount;
+
+    document.getElementById("successMessage")
+        .textContent =
+        language === "en"
+        ? "Transaction complete"
+        : "交易完成";
+
+    document.getElementById("successBalance")
+        .textContent = message;
+
+    showScreen("successScreen");
+
+    startCountdown(
+        8,
+        "successCountdown",
+        () => goHome()
+    );
+}
+
+
+function showError(message) {
+
+    clearInterval(chargeTimer);
+
+    document.getElementById("errorMessage")
+        .textContent = message;
+
+    showScreen("errorScreen");
+}
+
+
+function goBack() {
+
+    clearInterval(countdownTimer);
+
+    if (currentMode === "charge") {
+        cancelCharge();
+        return;
+    }
+
+    goHome();
+}
+
+
+function goHome() {
+
+    clearInterval(chargeTimer);
+    clearInterval(countdownTimer);
+
+    currentCard = null;
+    pendingDifferentCard = null;
+    currentMode = null;
+
+    fetch("/api/kiosk/end", {
         method: "POST",
-
         headers: {
             "Content-Type": "application/json"
         },
-
         body: JSON.stringify({
-            kiosk_id: kioskId
+            kiosk_id: KIOSK_ID
         })
-
     }).catch(() => {});
 
-    currentMode = null;
-    currentCard = null;
-
-    showScreen("home");
-
+    showScreen("homeScreen");
 }
 
 
@@ -1171,1667 +2731,370 @@ function escapeHtml(value) {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
-
 }
 
 
-async function updateLive() {
+function startBackgroundVideo() {
 
-    if (
-        currentMode !== "charge" ||
-        !currentCard
-    ) {
+    if (!videos.length) {
         return;
     }
 
-    try {
+    let index = 0;
 
-        const response =
-            await fetch(
-                "/api/kiosk/state?kiosk_id="
-                + encodeURIComponent(kioskId)
-            );
+    function loadVideo() {
 
-        const data =
-            await response.json();
+        video.src = videos[index];
 
-        if (!data.session) {
+        video.load();
+
+        video.play().catch(() => {});
+    }
+
+    video.addEventListener("error", () => {
+
+        index++;
+
+        if (index >= videos.length) {
+            video.style.display = "none";
             return;
         }
 
-        updateCharge(data);
+        loadVideo();
+    });
 
-    } catch {}
+    video.addEventListener("ended", () => {
 
+        index++;
+
+        if (index >= videos.length) {
+            index = 0;
+        }
+
+        loadVideo();
+    });
+
+    loadVideo();
 }
 
 
-setInterval(updateLive, 500);
+document.addEventListener("click", () => {
 
+    const active =
+        document.querySelector(".screen.active");
 
-window.addEventListener(
-    "click",
-    () => {
-
-        if (
-            currentMode === null
-        ) {
-            return;
-        }
-
+    if (
+        active &&
+        (
+            active.id === "scanScreen" ||
+            active.id === "confirmCardScreen"
+        )
+    ) {
+        focusScanner();
     }
-);
 
+}, true);
+
+
+setInterval(() => {
+
+    if (
+        document.getElementById("chargeScreen")
+            .classList.contains("active")
+    ) {
+
+        fetch(
+            "/api/kiosk/state?kiosk_id=" +
+            encodeURIComponent(KIOSK_ID)
+        )
+        .then(response => response.json())
+        .then(data => {
+
+            if (
+                data.active &&
+                data.amount_cents > 0
+            ) {
+
+                document.getElementById(
+                    "chargeInstruction"
+                ).textContent =
+                    language === "en"
+                    ? "Tap your card again to update it"
+                    : "请再次刷卡以更新余额";
+            }
+
+        })
+        .catch(() => {});
+    }
+
+}, 1000);
+
+
+setLanguageText();
+startBackgroundVideo();
 </script>
 
 </body>
 </html>
 """
 
-
-# ============================================================
-# KIOSK ROUTE
-# ============================================================
-
-@app.route("/")
-def kiosk():
-    return render_template_string(
-        KIOSK_HTML,
-        kiosk_id=KIOSK_ID
-    )
-
-
-@app.route("/kiosk")
-def kiosk_custom():
-    kiosk_id = request.args.get(
-        "kiosk_id",
-        KIOSK_ID
-    )
-
-    return render_template_string(
-        KIOSK_HTML,
-        kiosk_id=kiosk_id
-    )
-
-
-# ============================================================
-# CARD SCANNING
-# ============================================================
-
-@app.route("/api/kiosk/scan", methods=["POST"])
-def scan_card():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    kiosk_id = str(
-        data.get("kiosk_id", KIOSK_ID)
-    ).strip()
-
-    card_id = str(
-        data.get("card_id", "")
-    ).strip()
-
-    mode = str(
-        data.get("mode", "")
-    ).strip().lower()
-
-    if not card_id:
-        return jsonify({
-            "error": "No card ID was received."
-        }), 400
-
-    if mode not in (
-        "charge",
-        "balance",
-        "store"
-    ):
-        return jsonify({
-            "error": "Invalid operation."
-        }), 400
-
-    conn = get_db()
-
-    card = create_card(
-        conn,
-        card_id
-    )
-
-    close_sessions(
-        conn,
-        kiosk_id
-    )
-
-    if mode == "charge":
-
-        t = timestamp()
-
-        conn.execute("""
-            INSERT INTO sessions
-            (
-                kiosk_id,
-                card_id,
-                mode,
-                status,
-                coin_count,
-                amount_cents,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, 0, 0, ?, ?)
-        """, (
-            kiosk_id,
-            card_id,
-            "charge",
-            "active",
-            t,
-            t
-        ))
-
-        conn.commit()
-
-    balance_cents = card["balance_cents"]
-
-    products = []
-
-    if mode == "store":
-
-        rows = conn.execute("""
-            SELECT id, name, price_cents
-            FROM products
-            WHERE active = 1
-            ORDER BY id
-        """).fetchall()
-
-        for product in rows:
-
-            products.append({
-                "id": product["id"],
-                "name": product["name"],
-                "price_cents": product["price_cents"],
-                "price": money(
-                    product["price_cents"]
-                )
-            })
-
-    conn.close()
-
-    result = {
-        "success": True,
-        "card_id": card_id,
-        "balance_cents": balance_cents,
-        "balance": money(balance_cents)
-    }
-
-    if mode == "charge":
-
-        result.update({
-            "coin_count": 0,
-            "added_cents": 0,
-            "added": "$0.00"
-        })
-
-    if mode == "store":
-        result["products"] = products
-
-    return jsonify(result)
-
-
-# ============================================================
-# LIVE KIOSK STATE
-# ============================================================
-
-@app.route("/api/kiosk/state")
-def kiosk_state():
-
-    kiosk_id = request.args.get(
-        "kiosk_id",
-        KIOSK_ID
-    )
-
-    conn = get_db()
-
-    current = active_session(
-        conn,
-        kiosk_id
-    )
-
-    if current is None:
-
-        conn.close()
-
-        return jsonify({
-            "session": None
-        })
-
-    card = conn.execute("""
-        SELECT *
-        FROM cards
-        WHERE card_id = ?
-    """, (
-        current["card_id"],
-    )).fetchone()
-
-    conn.close()
-
-    return jsonify({
-
-        "session": True,
-
-        "card_id":
-            current["card_id"],
-
-        "coin_count":
-            current["coin_count"],
-
-        "added_cents":
-            current["amount_cents"],
-
-        "added":
-            money(current["amount_cents"]),
-
-        "balance_cents":
-            card["balance_cents"],
-
-        "balance":
-            money(card["balance_cents"])
-
-    })
-
-
-# ============================================================
-# COIN ACCEPTOR
-# ============================================================
-
-@app.route("/api/coin", methods=["POST"])
-def coin():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    kiosk_id = str(
-        data.get("kiosk_id", KIOSK_ID)
-    ).strip()
-
-    # Number of pulses/coins sent by the Pi
-    coins = int(
-        data.get("coins", 1)
-    )
-
-    if coins < 1:
-        coins = 1
-
-    amount = coins * COIN_VALUE_CENTS
-
-    conn = get_db()
-
-    current = active_session(
-        conn,
-        kiosk_id
-    )
-
-    # Every physical coin event is recorded.
-    # It is NOT silently discarded.
-    # It only becomes card credit when a charge
-    # session is active.
-
-    if current is None:
-
-        conn.execute("""
-            INSERT INTO coin_events
-            (
-                kiosk_id,
-                card_id,
-                accepted,
-                coins,
-                amount_cents,
-                reason,
-                created_at
-            )
-            VALUES (?, NULL, 0, ?, ?, ?, ?)
-        """, (
-            kiosk_id,
-            coins,
-            amount,
-            "NO_ACTIVE_CARD_SESSION",
-            timestamp()
-        ))
-
-        conn.commit()
-        conn.close()
-
-        return jsonify({
-
-            "success": False,
-
-            "accepted": False,
-
-            "coins": coins,
-
-            "amount_cents": amount,
-
-            "amount": money(amount),
-
-            "message":
-                "A card must be scanned before charging."
-
-        }), 409
-
-    card_id = current["card_id"]
-
-    card = conn.execute("""
-        SELECT *
-        FROM cards
-        WHERE card_id = ?
-    """, (
-        card_id,
-    )).fetchone()
-
-    new_balance = (
-        card["balance_cents"]
-        + amount
-    )
-
-    new_coin_count = (
-        current["coin_count"]
-        + coins
-    )
-
-    new_session_amount = (
-        current["amount_cents"]
-        + amount
-    )
-
-    t = timestamp()
-
-    conn.execute("""
-        UPDATE cards
-
-        SET balance_cents = ?,
-            updated_at = ?
-
-        WHERE card_id = ?
-    """, (
-        new_balance,
-        t,
-        card_id
-    ))
-
-    conn.execute("""
-        UPDATE sessions
-
-        SET coin_count = ?,
-            amount_cents = ?,
-            updated_at = ?
-
-        WHERE id = ?
-    """, (
-        new_coin_count,
-        new_session_amount,
-        t,
-        current["id"]
-    ))
-
-    conn.execute("""
-        INSERT INTO coin_events
-        (
-            kiosk_id,
-            card_id,
-            accepted,
-            coins,
-            amount_cents,
-            reason,
-            created_at
-        )
-        VALUES (?, ?, 1, ?, ?, ?, ?)
-    """, (
-        kiosk_id,
-        card_id,
-        coins,
-        amount,
-        "CARD_CHARGE",
-        t
-    ))
-
-    conn.execute("""
-        INSERT INTO transactions
-        (
-            kiosk_id,
-            card_id,
-            type,
-            amount_cents,
-            coins,
-            description,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        kiosk_id,
-        card_id,
-        "coin_charge",
-        amount,
-        coins,
-        "Coin charge",
-        t
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-
-        "success": True,
-
-        "accepted": True,
-
-        "card_id": card_id,
-
-        "coins": coins,
-
-        "amount_cents": amount,
-
-        "amount": money(amount),
-
-        "coin_count":
-            new_coin_count,
-
-        "balance_cents":
-            new_balance,
-
-        "balance":
-            money(new_balance)
-
-    })
-
-
-# ============================================================
-# END KIOSK SESSION
-# ============================================================
-
-@app.route("/api/kiosk/end", methods=["POST"])
-def end_session():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    kiosk_id = str(
-        data.get("kiosk_id", KIOSK_ID)
-    ).strip()
-
-    conn = get_db()
-
-    close_sessions(
-        conn,
-        kiosk_id
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "success": True
-    })
-
-
-# ============================================================
-# STORE
-# ============================================================
-
-@app.route("/api/store/buy", methods=["POST"])
-def store_buy():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    kiosk_id = str(
-        data.get("kiosk_id", KIOSK_ID)
-    ).strip()
-
-    card_id = str(
-        data.get("card_id", "")
-    ).strip()
-
-    try:
-        product_id = int(
-            data.get("product_id")
-        )
-    except:
-        return jsonify({
-            "error": "Invalid product."
-        }), 400
-
-    if not card_id:
-        return jsonify({
-            "error": "Scan a card first."
-        }), 400
-
-    conn = get_db()
-
-    card = conn.execute("""
-        SELECT *
-        FROM cards
-        WHERE card_id = ?
-    """, (
-        card_id,
-    )).fetchone()
-
-    if card is None:
-
-        conn.close()
-
-        return jsonify({
-            "error": "Card not found."
-        }), 404
-
-    product = conn.execute("""
-        SELECT *
-        FROM products
-        WHERE id = ?
-        AND active = 1
-    """, (
-        product_id,
-    )).fetchone()
-
-    if product is None:
-
-        conn.close()
-
-        return jsonify({
-            "error": "Product not found."
-        }), 404
-
-    price = product["price_cents"]
-
-    if card["balance_cents"] < price:
-
-        balance = card["balance_cents"]
-
-        conn.close()
-
-        return jsonify({
-
-            "error": "Insufficient balance.",
-
-            "balance_cents": balance,
-
-            "balance":
-                money(balance)
-
-        }), 400
-
-    new_balance = (
-        card["balance_cents"]
-        - price
-    )
-
-    t = timestamp()
-
-    conn.execute("""
-        UPDATE cards
-
-        SET balance_cents = ?,
-            updated_at = ?
-
-        WHERE card_id = ?
-    """, (
-        new_balance,
-        t,
-        card_id
-    ))
-
-    conn.execute("""
-        INSERT INTO transactions
-        (
-            kiosk_id,
-            card_id,
-            type,
-            amount_cents,
-            coins,
-            description,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, 0, ?, ?)
-    """, (
-        kiosk_id,
-        card_id,
-        "store_purchase",
-        -price,
-        product["name"],
-        t
-    ))
-
-    conn.commit()
-
-    products = conn.execute("""
-        SELECT *
-        FROM products
-        WHERE active = 1
-        ORDER BY id
-    """).fetchall()
-
-    conn.close()
-
-    return jsonify({
-
-        "success": True,
-
-        "balance_cents":
-            new_balance,
-
-        "balance":
-            money(new_balance),
-
-        "products": [
-
-            {
-                "id": p["id"],
-                "name": p["name"],
-                "price_cents":
-                    p["price_cents"],
-                "price":
-                    money(p["price_cents"])
-            }
-
-            for p in products
-
-        ]
-
-    })
-
-
-# ============================================================
-# ADMIN LOGIN
-# ============================================================
 
 ADMIN_LOGIN_HTML = r"""
 <!DOCTYPE html>
 <html>
-
 <head>
-
-<meta charset="UTF-8">
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin Login</title>
-
 <style>
-
 body {
-    margin: 0;
-
-    background: #0e1014;
-    color: white;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-
-    min-height: 100vh;
-
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    margin:0;
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    background:#071018;
+    color:white;
+    font-family:Arial;
 }
-
-.login {
-    width: 360px;
-
-    background: #181b22;
-
-    border: 1px solid #303641;
-
-    border-radius: 20px;
-
-    padding: 35px;
+form {
+    width:350px;
+    padding:35px;
+    border-radius:25px;
+    background:#111d27;
 }
-
-h1 {
-    margin-top: 0;
+input,button {
+    width:100%;
+    height:55px;
+    margin-top:15px;
+    border-radius:12px;
+    border:0;
+    padding:0 15px;
+    font-size:18px;
+    box-sizing:border-box;
 }
-
-input {
-    width: 100%;
-
-    padding: 14px;
-
-    margin-top: 10px;
-    margin-bottom: 18px;
-
-    border: 1px solid #353b46;
-
-    border-radius: 10px;
-
-    background: #0e1014;
-
-    color: white;
-
-    font-size: 16px;
-}
-
 button {
-    width: 100%;
-
-    padding: 14px;
-
-    border: none;
-
-    border-radius: 10px;
-
-    background: white;
-    color: black;
-
-    font-weight: 800;
-
-    cursor: pointer;
+    background:#3d8fc4;
+    color:white;
+    font-weight:bold;
 }
-
-.error {
-    color: #ff7777;
-    margin-bottom: 15px;
-}
-
 </style>
-
 </head>
-
 <body>
-
-<div class="login">
-
-<h1>Admin Login</h1>
-
-{% if error %}
-<div class="error">
-{{ error }}
-</div>
-{% endif %}
-
-<form method="POST">
-
-<input
-    name="username"
-    placeholder="Username"
-    autocomplete="username"
-    required>
-
-<input
-    name="password"
-    type="password"
-    placeholder="Password"
-    autocomplete="current-password"
-    required>
-
-<button>
-LOGIN
-</button>
-
+<form method="post">
+    <h1>Admin</h1>
+    <input name="username" placeholder="Username">
+    <input name="password" type="password" placeholder="Password">
+    <button>Login</button>
 </form>
-
-</div>
-
 </body>
-
 </html>
 """
 
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-
-    if request.method == "POST":
-
-        username = request.form.get(
-            "username",
-            ""
-        )
-
-        password = request.form.get(
-            "password",
-            ""
-        )
-
-        if (
-            username == ADMIN_USERNAME
-            and
-            password == ADMIN_PASSWORD
-        ):
-
-            session["admin"] = True
-
-            return redirect("/admin")
-
-        return render_template_string(
-            ADMIN_LOGIN_HTML,
-            error="Incorrect username or password."
-        )
-
-    return render_template_string(
-        ADMIN_LOGIN_HTML,
-        error=None
-    )
-
-
-@app.route("/admin/logout")
-def admin_logout():
-
-    session.clear()
-
-    return redirect("/admin/login")
-
-
-# ============================================================
-# ADMIN DASHBOARD
-# ============================================================
 
 ADMIN_HTML = r"""
 <!DOCTYPE html>
 <html>
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
-
-<title>Service Kiosk Admin</title>
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kiosk Admin</title>
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
 body {
-    margin: 0;
-
-    background: #0e1014;
-    color: white;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
+    margin:0;
+    background:#071018;
+    color:white;
+    font-family:Arial;
+    padding:30px;
 }
-
-.header {
-    height: 75px;
-
-    background: #171a20;
-
-    border-bottom: 1px solid #292d35;
-
-    display: flex;
-
-    align-items: center;
-
-    justify-content: space-between;
-
-    padding: 0 30px;
+h1 {
+    margin-top:0;
 }
-
-.logo {
-    font-size: 23px;
-    font-weight: 900;
-}
-
-.logout {
-    color: white;
-    text-decoration: none;
-
-    background: #252a33;
-
-    padding: 10px 16px;
-
-    border-radius: 9px;
-}
-
-.container {
-    width: min(1250px, 94%);
-    margin: 35px auto;
-}
-
-.stats {
-    display: grid;
-
-    grid-template-columns:
-        repeat(4, 1fr);
-
-    gap: 18px;
-
-    margin-bottom: 30px;
-}
-
-.stat {
-    background: #181b22;
-
-    border: 1px solid #303641;
-
-    border-radius: 16px;
-
-    padding: 23px;
-}
-
-.label {
-    color: #8f97a5;
-    font-size: 14px;
-}
-
-.value {
-    font-size: 30px;
-    font-weight: 900;
-    margin-top: 8px;
-}
-
 .panel {
-    background: #181b22;
-
-    border: 1px solid #303641;
-
-    border-radius: 18px;
-
-    padding: 25px;
-
-    margin-bottom: 25px;
+    background:#111d27;
+    border-radius:20px;
+    padding:25px;
+    margin-bottom:25px;
 }
-
-h2 {
-    margin-top: 0;
-}
-
 table {
-    width: 100%;
-    border-collapse: collapse;
+    width:100%;
+    border-collapse:collapse;
 }
-
-th,
-td {
-    text-align: left;
-
-    padding: 14px 10px;
-
-    border-bottom:
-        1px solid #2b3039;
+th,td {
+    padding:12px;
+    border-bottom:1px solid #263540;
+    text-align:left;
 }
-
-th {
-    color: #8f97a5;
-    font-size: 13px;
+.online {
+    color:#62d99b;
 }
-
-.status {
-    display: inline-block;
-
-    padding: 5px 9px;
-
-    border-radius: 7px;
-
-    background: #243b2b;
-
-    color: #8de0a0;
-
-    font-size: 12px;
-}
-
-@media(max-width: 800px) {
-
-    .stats {
-        grid-template-columns: 1fr 1fr;
-    }
-
-}
-
 </style>
-
 </head>
-
 <body>
 
-<header class="header">
-
-<div class="logo">
-SERVICE KIOSK ADMIN
-</div>
-
-<a
-    href="/admin/logout"
-    class="logout">
-    Logout
-</a>
-
-</header>
-
-
-<div class="container">
-
-<div class="stats">
-
-<div class="stat">
-
-<div class="label">
-Cards
-</div>
-
-<div
-    class="value"
-    id="cards">
-0
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="label">
-Active Sessions
-</div>
-
-<div
-    class="value"
-    id="sessions">
-0
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="label">
-Coins Accepted
-</div>
-
-<div
-    class="value"
-    id="coins">
-0
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="label">
-Money Added
-</div>
-
-<div
-    class="value"
-    id="money">
-$0.00
-</div>
-
-</div>
-
-</div>
-
+<h1>Kiosk Administration</h1>
 
 <div class="panel">
-
-<h2>
-Active Kiosks
-</h2>
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>Kiosk</th>
-<th>Mode</th>
-<th>Card</th>
-<th>Coins</th>
-<th>Added</th>
-<th>Updated</th>
-
-</tr>
-
-</thead>
-
-<tbody id="sessionsTable">
-
-</tbody>
-
-</table>
-
+    <h2>Active Sessions</h2>
+    <div id="sessions">Loading...</div>
 </div>
-
 
 <div class="panel">
-
-<h2>
-Recent Transactions
-</h2>
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>Time</th>
-<th>Kiosk</th>
-<th>Card</th>
-<th>Type</th>
-<th>Coins</th>
-<th>Amount</th>
-
-</tr>
-
-</thead>
-
-<tbody id="transactionsTable">
-
-</tbody>
-
-</table>
-
+    <h2>Transactions</h2>
+    <div id="transactions">Loading...</div>
 </div>
-
 
 <div class="panel">
-
-<h2>
-Recent Coin Events
-</h2>
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>Time</th>
-<th>Kiosk</th>
-<th>Card</th>
-<th>Status</th>
-<th>Coins</th>
-<th>Amount</th>
-<th>Reason</th>
-
-</tr>
-
-</thead>
-
-<tbody id="coinsTable">
-
-</tbody>
-
-</table>
-
+    <h2>Coin Events</h2>
+    <div id="coins">Loading...</div>
 </div>
-
-</div>
-
 
 <script>
 
 function escapeHtml(value) {
-
-    return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-
+    return String(value)
+        .replaceAll("&","&amp;")
+        .replaceAll("<","&lt;")
+        .replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;")
+        .replaceAll("'","&#039;");
 }
 
-
-async function updateDashboard() {
+async function refresh() {
 
     try {
 
         const response =
-            await fetch(
-                "/api/admin/live"
-            );
-
-        if (!response.ok) {
-            return;
-        }
+            await fetch("/api/admin/live");
 
         const data =
             await response.json();
 
+        let sessions = "";
 
-        document
-            .getElementById("cards")
-            .innerText =
-            data.cards;
+        if (!data.sessions.length) {
+            sessions = "No active sessions.";
+        } else {
 
-
-        document
-            .getElementById("sessions")
-            .innerText =
-            data.active_sessions;
-
-
-        document
-            .getElementById("coins")
-            .innerText =
-            data.total_coins;
-
-
-        document
-            .getElementById("money")
-            .innerText =
-            data.total_money;
-
-
-        const sessions =
-            document.getElementById(
-                "sessionsTable"
-            );
-
-        sessions.innerHTML = "";
-
-        data.sessions.forEach(row => {
-
-            sessions.innerHTML += `
-
-                <tr>
-
-                    <td>
-                        ${escapeHtml(row.kiosk_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.mode)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.card_id)}
-                    </td>
-
-                    <td>
-                        ${row.coin_count}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.amount)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.updated_at)}
-                    </td>
-
-                </tr>
-
+            sessions = `
+            <table>
+            <tr>
+                <th>Kiosk</th>
+                <th>Card</th>
+                <th>Mode</th>
+                <th>Coins</th>
+                <th>Amount</th>
+                <th>Updated</th>
+            </tr>
             `;
 
-        });
+            data.sessions.forEach(row => {
+
+                sessions += `
+                <tr>
+                    <td>${escapeHtml(row.kiosk_id)}</td>
+                    <td>${escapeHtml(row.card_id)}</td>
+                    <td>${escapeHtml(row.mode)}</td>
+                    <td>${row.coin_count}</td>
+                    <td>${escapeHtml(row.amount)}</td>
+                    <td>${escapeHtml(row.updated_at)}</td>
+                </tr>
+                `;
+            });
+
+            sessions += "</table>";
+        }
+
+        document.getElementById("sessions")
+            .innerHTML = sessions;
 
 
-        const transactions =
-            document.getElementById(
-                "transactionsTable"
-            );
-
-        transactions.innerHTML = "";
+        let transactions = `
+        <table>
+        <tr>
+            <th>Time</th>
+            <th>Kiosk</th>
+            <th>Card</th>
+            <th>Type</th>
+            <th>Amount</th>
+            <th>Coins</th>
+            <th>Description</th>
+        </tr>
+        `;
 
         data.transactions.forEach(row => {
 
-            transactions.innerHTML += `
-
-                <tr>
-
-                    <td>
-                        ${escapeHtml(row.created_at)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.kiosk_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.card_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.type)}
-                    </td>
-
-                    <td>
-                        ${row.coins}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.amount)}
-                    </td>
-
-                </tr>
-
+            transactions += `
+            <tr>
+                <td>${escapeHtml(row.time)}</td>
+                <td>${escapeHtml(row.kiosk)}</td>
+                <td>${escapeHtml(row.card)}</td>
+                <td>${escapeHtml(row.type)}</td>
+                <td>${escapeHtml(row.amount)}</td>
+                <td>${row.coins}</td>
+                <td>${escapeHtml(row.description)}</td>
+            </tr>
             `;
-
         });
 
+        transactions += "</table>";
 
-        const coins =
-            document.getElementById(
-                "coinsTable"
-            );
+        document.getElementById("transactions")
+            .innerHTML = transactions;
 
-        coins.innerHTML = "";
 
-        data.coin_events.forEach(row => {
+        let coins = `
+        <table>
+        <tr>
+            <th>Time</th>
+            <th>Kiosk</th>
+            <th>Card</th>
+            <th>Accepted</th>
+            <th>Coins</th>
+            <th>Amount</th>
+            <th>Reason</th>
+        </tr>
+        `;
 
-            coins.innerHTML += `
+        data.coins.forEach(row => {
 
-                <tr>
-
-                    <td>
-                        ${escapeHtml(row.created_at)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.kiosk_id)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.card_id || "-")}
-                    </td>
-
-                    <td>
-
-                        <span class="status">
-
-                            ${row.accepted
-                                ? "Accepted"
-                                : "Not assigned"}
-
-                        </span>
-
-                    </td>
-
-                    <td>
-                        ${row.coins}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.amount)}
-                    </td>
-
-                    <td>
-                        ${escapeHtml(row.reason || "-")}
-                    </td>
-
-                </tr>
-
+            coins += `
+            <tr>
+                <td>${escapeHtml(row.time)}</td>
+                <td>${escapeHtml(row.kiosk)}</td>
+                <td>${escapeHtml(row.card)}</td>
+                <td>${row.accepted ? "YES" : "NO"}</td>
+                <td>${row.coins}</td>
+                <td>${escapeHtml(row.amount)}</td>
+                <td>${escapeHtml(row.reason)}</td>
+            </tr>
             `;
-
         });
 
-    } catch {}
+        coins += "</table>";
 
+        document.getElementById("coins")
+            .innerHTML = coins;
+
+    } catch (error) {
+
+        document.getElementById("sessions")
+            .textContent = "Unable to load data.";
+    }
 }
 
+refresh();
 
-updateDashboard();
-
-setInterval(
-    updateDashboard,
-    1000
-);
+setInterval(refresh, 1000);
 
 </script>
 
 </body>
-
 </html>
 """
 
 
-@app.route("/admin")
-def admin():
-
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    return render_template_string(
-        ADMIN_HTML
-    )
-
-
-# ============================================================
-# ADMIN LIVE DATA
-# ============================================================
-
-@app.route("/api/admin/live")
-def admin_live():
-
-    if not session.get("admin"):
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
-    conn = get_db()
-
-    cards = conn.execute("""
-        SELECT COUNT(*) AS count
-        FROM cards
-    """).fetchone()["count"]
-
-    active_sessions = conn.execute("""
-        SELECT COUNT(*) AS count
-        FROM sessions
-        WHERE status = 'active'
-    """).fetchone()["count"]
-
-    total_coins = conn.execute("""
-        SELECT COALESCE(
-            SUM(coins),
-            0
-        ) AS total
-        FROM coin_events
-        WHERE accepted = 1
-    """).fetchone()["total"]
-
-    total_money = conn.execute("""
-        SELECT COALESCE(
-            SUM(amount_cents),
-            0
-        ) AS total
-        FROM coin_events
-        WHERE accepted = 1
-    """).fetchone()["total"]
-
-    sessions = conn.execute("""
-        SELECT *
-        FROM sessions
-        WHERE status = 'active'
-        ORDER BY id DESC
-        LIMIT 50
-    """).fetchall()
-
-    transactions = conn.execute("""
-        SELECT *
-        FROM transactions
-        ORDER BY id DESC
-        LIMIT 50
-    """).fetchall()
-
-    coin_events = conn.execute("""
-        SELECT *
-        FROM coin_events
-        ORDER BY id DESC
-        LIMIT 50
-    """).fetchall()
-
-    conn.close()
-
-    return jsonify({
-
-        "cards": cards,
-
-        "active_sessions":
-            active_sessions,
-
-        "total_coins":
-            total_coins,
-
-        "total_money":
-            money(total_money),
-
-        "sessions": [
-
-            {
-                "kiosk_id":
-                    row["kiosk_id"],
-
-                "mode":
-                    row["mode"],
-
-                "card_id":
-                    row["card_id"],
-
-                "coin_count":
-                    row["coin_count"],
-
-                "amount":
-                    money(row["amount_cents"]),
-
-                "updated_at":
-                    row["updated_at"]
-
-            }
-
-            for row in sessions
-
-        ],
-
-        "transactions": [
-
-            {
-                "created_at":
-                    row["created_at"],
-
-                "kiosk_id":
-                    row["kiosk_id"],
-
-                "card_id":
-                    row["card_id"],
-
-                "type":
-                    row["type"],
-
-                "coins":
-                    row["coins"],
-
-                "amount":
-                    money(abs(row["amount_cents"]))
-
-            }
-
-            for row in transactions
-
-        ],
-
-        "coin_events": [
-
-            {
-                "created_at":
-                    row["created_at"],
-
-                "kiosk_id":
-                    row["kiosk_id"],
-
-                "card_id":
-                    row["card_id"],
-
-                "accepted":
-                    bool(row["accepted"]),
-
-                "coins":
-                    row["coins"],
-
-                "amount":
-                    money(row["amount_cents"]),
-
-                "reason":
-                    row["reason"]
-
-            }
-
-            for row in coin_events
-
-        ]
-
-    })
-
-
-# ============================================================
-# CARD BALANCE API
-# ============================================================
-
-@app.route("/api/card/<card_id>")
-def card_balance(card_id):
-
-    conn = get_db()
-
-    card = conn.execute("""
-        SELECT *
-        FROM cards
-        WHERE card_id = ?
-    """, (
-        card_id,
-    )).fetchone()
-
-    conn.close()
-
-    if card is None:
-        return jsonify({
-            "error": "Card not found."
-        }), 404
-
-    return jsonify({
-
-        "card_id":
-            card["card_id"],
-
-        "balance_cents":
-            card["balance_cents"],
-
-        "balance":
-            money(card["balance_cents"])
-
-    })
-
-
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
-
-    print()
-    print("========================================")
-    print("        SERVICE KIOSK SERVER")
-    print("========================================")
-    print()
-    print("Kiosk:")
-    print("http://127.0.0.1:5000")
-    print()
-    print("Admin:")
-    print("http://127.0.0.1:5000/admin")
-    print()
-    print("Admin username: admin")
-    print("Admin password: admin")
-    print()
-    print("Kiosk ID:", KIOSK_ID)
-    print()
-    print("========================================")
-    print()
-
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
